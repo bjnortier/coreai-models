@@ -89,25 +89,100 @@ mode is a repeated word rather than dropped speech.
 Windowing keys off `MelConfig.nFrames`, so a dynamic encoder (Parakeet's, unless
 exported at a static length) still takes the whole waveform in one pass.
 
-### `swift/Sources/CoreAISpeech/SpeechRecognitionBundle.swift` — decoder pinned to CPU
+### Compute-unit selection: decode graphs pinned to CPU
 
-`WhisperDecoder` sends `position_ids` whose length grows by one per token, so every
-decode step presents a shape the accelerator backends have not specialized yet:
-~300 ms of recompilation per step, and the specialization cache does not survive the
-process, so it is paid on every run. The CPU backend does not specialize per shape and
-runs this 4-layer single-token graph in ~5 ms.
+**Added:** `SpeechComputeUnit` / `SpeechComputeUnits` in `SpeechRecognitionBundle.swift`,
+`--compute-encoder` / `--compute-decoder` on the CLI
+
+Upstream loads every speech asset with bare `AIModel(contentsOf:)` — default
+specialization, which probes the Neural Engine first. Measured, that is the wrong
+default for the per-token graphs of *both* architectures, for the same reason: they
+are tiny and launch-bound, and each step presents a shape the accelerator backends
+have not specialized yet (Whisper's `position_ids` grows by one per token; Parakeet's
+TDT loop runs its two graphs once or more per emitted token). The CPU backend does
+not specialize per shape.
+
+The encoder is left `.automatic`: it wants the GPU, and the runtime's own fallback
+already lands it there (see the Neural Engine note below).
+
+**Whisper**, 5.5 s clip, per decode step:
 
 | Decoder placement | ms/step |
 | --- | ---: |
-| Default specialization | 1669.3 |
-| CPU | 4.8 |
+| Default specialization | 1576.2 |
+| **CPU** | **4.9** |
 
-There is precedent: `SpeechRecognizerMain.swift:219` already pins the monolithic
-Whisper path to CPU, with the comment *"the monolithic f16/f32 Whisper export decodes
-incorrectly on the default compute path"*.
+**Parakeet TDT**, same clip, per decode step (encoder unchanged at ~26 ms):
 
-The alternative — a fixed-length `position_ids`, or setting `expectFrequentReshapes`
-as `ModelStructure.dynamic` does — would be a larger change to the runtime contract.
+| Decode graphs | ms/step | decode total |
+| --- | ---: | ---: |
+| Default specialization | 0.7 | 52.8 ms |
+| GPU | 0.8 | 55.3 ms |
+| **CPU** | **0.3** | **37.8 ms** |
+
+Per-graph medians behind that, from `AIModel.load` directly:
+
+| graph | automatic | ANE | GPU | CPU |
+| --- | ---: | ---: | ---: | ---: |
+| parakeet encoder (30 s window) | *aborts* | 120.97 | **26.06** | 188.97 |
+| parakeet decoder_step | 0.79 | 0.67 | 0.72 | **0.12** |
+| parakeet joint | *fails to load* | 0.28 | 0.62 | **0.18** |
+
+There is precedent for pinning: `SpeechRecognizerMain.swift` already pins the
+monolithic Whisper path to CPU, commented *"the monolithic f16/f32 Whisper export
+decodes incorrectly on the default compute path"*.
+
+For Whisper the alternative — a fixed-length `position_ids`, or setting
+`expectFrequentReshapes` as `ModelStructure.dynamic` does — would be a larger change
+to the runtime contract.
+
+#### These numbers are Mac-only
+
+Everything above was measured on Apple silicon **Mac**. iOS has a different balance:
+the GPU is several times smaller while the Neural Engine is comparable silicon, so
+the GPU-beats-ANE result for the encoder may well invert, and the CPU pin for the
+decode graphs deserves re-checking against battery as well as latency.
+
+The policy is therefore a parameter, not a constant:
+
+```swift
+// The measured Mac default.
+let model = try await SpeechRecognitionModel(resourcesAt: url)
+
+// Re-measuring on device: override per stage.
+let model = try await SpeechRecognitionModel(
+    resourcesAt: url,
+    computeUnits: SpeechComputeUnits(encoder: .neuralEngine, decoder: .neuralEngine))
+
+// The pre-measurement baseline, for A/B.
+let model = try await SpeechRecognitionModel(
+    resourcesAt: url, computeUnits: .unspecialized)
+```
+
+and on the CLI:
+
+```sh
+speech-recognizer --model <bundle> --audio-path a.wav \
+  --compute-encoder gpu --compute-decoder cpu    # automatic | cpu | gpu | neuralEngine
+```
+
+#### Neural Engine: both encoders hit the same lowering bug
+
+Whisper's and Parakeet's encoders both fail to lower to the ANE with the same
+signature — a rank-promoting broadcast the compiler mis-infers:
+
+```
+whisper:  inferred 'memref<1x1500x1500x1280xf16>' vs 'memref<1x1x1500x1280xf16>'
+parakeet: inferred 'memref<1x376x376x1024xf16>'   vs 'memref<1x1x376x1024xf16>'
+```
+
+For Whisper this is **fixed in the export** (`_BatchedPositions`, see
+`models/whisper/README_KV.md`). For Parakeet it is not, and there is little reason to:
+even lowering cleanly, the ANE encoder is 121 ms against the GPU's 26 ms at fp16. It
+would only become interesting with palettized weights — the pre-fork measurements put
+a 4-bit palettized encoder at ~38 ms on ANE. Note that in Python the failure *aborts
+the process*; the Swift runtime survives it by falling back, which is why the default
+policy still gets a 26 ms encoder.
 
 ---
 

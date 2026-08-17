@@ -176,8 +176,14 @@ mis-infer the add as `[1, 1500, 1500, 1280]` and the encoder fails to compile.
 step presents a shape the accelerator backends have not specialized yet — about
 300 ms of recompilation each, and the specialization cache does not survive the
 process, so it is paid on every run. The CPU backend does not specialize per shape
-and runs this 4-layer single-token graph in ~5 ms, so `SpeechRecognitionBundle`
-pins the decoder to CPU. See [`FORK.md`](../../FORK.md).
+and runs this 4-layer single-token graph in ~5 ms, so the default
+`SpeechComputeUnits` policy pins the decoder to CPU. Parakeet's per-token graphs
+turned out to want the same treatment for the same reason.
+
+Those defaults were measured on Mac and are overridable per stage —
+`SpeechComputeUnits(encoder:decoder:)`, or `--compute-encoder` / `--compute-decoder`
+on the CLI. Re-measure before trusting them on iOS, where the GPU is much smaller
+relative to the Neural Engine. See [`FORK.md`](../../FORK.md).
 
 ## Limits
 

@@ -48,8 +48,13 @@ public actor SpeechRecognitionModel {
     /// config, so rebuilding it on every transcription is wasted work.
     private let melBasis: MelSpectrogram.Basis
 
-    public init(resourcesAt url: URL) async throws {
-        self.bundle = try await SpeechRecognitionBundle(at: url)
+    /// - Parameter computeUnits: which compute unit each stage is specialized for.
+    ///   The default is measured on Mac; see ``SpeechComputeUnits`` before relying
+    ///   on it elsewhere.
+    public init(
+        resourcesAt url: URL, computeUnits: SpeechComputeUnits = .default
+    ) async throws {
+        self.bundle = try await SpeechRecognitionBundle(at: url, computeUnits: computeUnits)
         let encoder: AIModel
         switch bundle.kind {
         case .whisper(let assets):

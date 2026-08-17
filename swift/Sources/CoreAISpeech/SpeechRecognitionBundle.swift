@@ -23,6 +23,67 @@ import Tokenizers
 /// "speech_recognizer"` and `config.architecture: "parakeet_tdt"`, an `assets`
 /// map for `encoder` / `decoder_step` / `joint`, and a TDT `config` block), the
 /// three `.aimodel` assets, and a `processor/` subdirectory carrying the tokenizer.
+// MARK: - Compute unit selection
+
+/// Compute unit to specialize a graph for.
+public enum SpeechComputeUnit: String, Sendable, CaseIterable {
+    /// Default specialization — the runtime picks, probing the Neural Engine first.
+    case automatic
+    case cpu
+    case gpu
+    case neuralEngine
+
+    var specializationOptions: SpecializationOptions? {
+        switch self {
+        case .automatic: return nil
+        case .cpu: return SpecializationOptions(preferredComputeUnitKind: .cpu)
+        case .gpu: return SpecializationOptions(preferredComputeUnitKind: .gpu)
+        case .neuralEngine: return SpecializationOptions(preferredComputeUnitKind: .neuralEngine)
+        }
+    }
+
+    func load(_ url: URL) async throws -> AIModel {
+        if let options = specializationOptions {
+            return try await AIModel(contentsOf: url, options: options)
+        }
+        return try await AIModel(contentsOf: url)
+    }
+}
+
+/// Which compute unit each stage of a speech bundle is loaded for.
+///
+/// The two stages want opposite things. The encoder is one large pass per window
+/// and is throughput-bound, so it wants the GPU. The per-token graphs are tiny and
+/// launch-bound, and both architectures feed them a shape that changes every step —
+/// Whisper's growing `position_ids`, Parakeet's TDT loop — which the accelerator
+/// backends re-specialize on. The CPU backend does not specialize per shape and
+/// wins on both counts.
+///
+/// The defaults were measured on Apple silicon **Mac**. iOS has a different balance
+/// — a much smaller GPU against a comparable Neural Engine — so re-measure there
+/// rather than assuming these carry over. See `FORK.md` for the numbers and method.
+public struct SpeechComputeUnits: Sendable, Equatable {
+    /// Encoder. `.automatic` in the default policy: neither Whisper's nor Parakeet's
+    /// encoder lowers to the Neural Engine today, and the runtime's own fallback
+    /// already lands them on the GPU, which measured fastest.
+    public var encoder: SpeechComputeUnit
+    /// Per-token graphs: Whisper's decoder step, Parakeet's `decoder_step` + `joint`.
+    public var decoder: SpeechComputeUnit
+
+    public init(encoder: SpeechComputeUnit = .automatic, decoder: SpeechComputeUnit = .cpu) {
+        self.encoder = encoder
+        self.decoder = decoder
+    }
+
+    /// What the runtime used before any of this was measured: everything automatic.
+    /// Useful as an A/B baseline when re-measuring on a new platform.
+    public static let unspecialized = SpeechComputeUnits(encoder: .automatic, decoder: .automatic)
+
+    public static let `default` = SpeechComputeUnits()
+}
+
+// MARK: - SpeechRecognitionBundle
+
 public struct SpeechRecognitionBundle: Sendable {
     public let kind: Kind
     public let tokenizer: (any Tokenizer)?
@@ -58,7 +119,7 @@ public struct SpeechRecognitionBundle: Sendable {
         public let streamingConfig: StreamingConfig?
     }
 
-    public init(at url: URL) async throws {
+    public init(at url: URL, computeUnits: SpeechComputeUnits = .default) async throws {
         let metadataURL = url.appending(path: "metadata.json")
         if FileManager.default.fileExists(atPath: metadataURL.path) {
             let bundle = try ModelBundle(at: url)
@@ -66,11 +127,13 @@ public struct SpeechRecognitionBundle: Sendable {
             case .speechRecognizer:
                 switch Self.architecture(from: bundle.raw) {
                 case .parakeetTDT:
-                    let assets = try await Self.loadParakeetTDT(bundle: bundle)
+                    let assets = try await Self.loadParakeetTDT(
+                        bundle: bundle, computeUnits: computeUnits)
                     self.kind = .parakeetTDT(assets)
                     self.tokenizer = try? await Self.loadParakeetTokenizer(bundleURL: url)
                 case .whisper:
-                    let assets = try await Self.loadWhisper(bundleURL: url)
+                    let assets = try await Self.loadWhisper(
+                        bundleURL: url, computeUnits: computeUnits)
                     self.kind = .whisper(assets)
                     self.tokenizer = try? await Self.loadWhisperTokenizer(
                         bundleURL: url, config: assets.generationConfig)
@@ -82,7 +145,7 @@ public struct SpeechRecognitionBundle: Sendable {
             return
         }
         // Legacy Whisper bundle (no metadata.json).
-        let assets = try await Self.loadWhisper(bundleURL: url)
+        let assets = try await Self.loadWhisper(bundleURL: url, computeUnits: computeUnits)
         self.kind = .whisper(assets)
         self.tokenizer = try? await Self.loadWhisperTokenizer(
             bundleURL: url, config: assets.generationConfig)
@@ -101,7 +164,9 @@ public struct SpeechRecognitionBundle: Sendable {
         return payload?.config?.architecture ?? .whisper
     }
 
-    private static func loadWhisper(bundleURL: URL) async throws -> WhisperAssets {
+    private static func loadWhisper(
+        bundleURL: URL, computeUnits: SpeechComputeUnits
+    ) async throws -> WhisperAssets {
         let encURL = bundleURL.appending(path: "encoder.aimodel")
         let decURL = bundleURL.appending(path: "decoder.aimodel")
         guard FileManager.default.fileExists(atPath: encURL.path),
@@ -110,16 +175,14 @@ public struct SpeechRecognitionBundle: Sendable {
             throw SpeechError.missingModel(
                 "Whisper bundle at \(bundleURL.lastPathComponent) must contain encoder.aimodel and decoder.aimodel")
         }
-        let encoder = try await AIModel(contentsOf: encURL)
+        let encoder = try await computeUnits.encoder.load(encURL)
         // The decoder step takes `position_ids` whose length grows by one per
         // token, so every step presents a shape the accelerator backends have
         // not specialized yet — ~300 ms of recompilation each, and the
         // specialization cache does not survive the process. The CPU backend
         // does not specialize per shape and runs this 4-layer, single-token
         // graph in ~5 ms, so it is both simpler and ~300x faster here.
-        let decoder = try await AIModel(
-            contentsOf: decURL,
-            options: SpecializationOptions(preferredComputeUnitKind: .cpu))
+        let decoder = try await computeUnits.decoder.load(decURL)
         let cfgURL = bundleURL.appending(path: "generation_config.json")
         let generationConfig = (try? GenerationConfig(from: cfgURL)) ?? .whisper
         return WhisperAssets(
@@ -127,13 +190,19 @@ public struct SpeechRecognitionBundle: Sendable {
             generationConfig: generationConfig, melConfig: .whisper)
     }
 
-    private static func loadParakeetTDT(bundle: ModelBundle) async throws -> ParakeetTDTAssets {
+    private static func loadParakeetTDT(
+        bundle: ModelBundle, computeUnits: SpeechComputeUnits
+    ) async throws -> ParakeetTDTAssets {
         let encURL = try bundle.requireModelURL(for: "encoder")
         let stepURL = try bundle.requireModelURL(for: "decoder_step")
         let jointURL = try bundle.requireModelURL(for: "joint")
-        let encoder = try await AIModel(contentsOf: encURL)
-        let decoderStep = try await AIModel(contentsOf: stepURL)
-        let joint = try await AIModel(contentsOf: jointURL)
+        let encoder = try await computeUnits.encoder.load(encURL)
+        // Both per-token graphs are sub-millisecond and launch-bound, and the TDT
+        // loop runs each of them once or more per emitted token. On CPU they are
+        // ~0.12 ms and ~0.18 ms against ~0.79 ms and a failed default load — a
+        // ~2.4x faster decode loop end to end.
+        let decoderStep = try await computeUnits.decoder.load(stepURL)
+        let joint = try await computeUnits.decoder.load(jointURL)
         let config = try ParakeetTDTConfig.decode(fromMetadata: bundle.raw)
 
         // Auto-detect static encoder shape and bake nFrames into the mel config

@@ -12,6 +12,11 @@ import Tokenizers
 
 // MARK: - Entry point
 
+/// Declared here rather than in CoreAISpeech so the library keeps no dependency on
+/// ArgumentParser. `SpeechComputeUnit` is `RawRepresentable<String>` and
+/// `CaseIterable`, so parsing and the help listing both come for free.
+extension SpeechComputeUnit: ExpressibleByArgument {}
+
 @main
 struct SpeechRecognizer: AsyncParsableCommand {
     static let configuration = CommandConfiguration(
@@ -66,6 +71,18 @@ struct SpeechRecognizer: AsyncParsableCommand {
             value here to opt an offline run in. Parakeet TDT only.
             """)
     var resetAfterSilenceFrames: Int?
+
+    @Option(
+        help:
+            "Compute unit for the encoder: automatic, cpu, gpu, neuralEngine. Defaults to automatic; the runtime falls back to the GPU where a graph will not lower to the Neural Engine."
+    )
+    var computeEncoder: SpeechComputeUnit = SpeechComputeUnits.default.encoder
+
+    @Option(
+        help:
+            "Compute unit for the per-token decode graphs (Whisper's decoder step, Parakeet's decoder_step + joint). Defaults to cpu, which measured fastest on Mac; re-measure on other platforms."
+    )
+    var computeDecoder: SpeechComputeUnit = SpeechComputeUnits.default.decoder
 
     @Option(
         help:
@@ -193,7 +210,9 @@ struct SpeechRecognizer: AsyncParsableCommand {
             try await runBundle(
                 bundleURL: bundleURL, audioPath: audioPath, warmup: warmup, verbose: verbose,
                 dumpMel: dumpMel, windowOverlap: windowOverlap,
-                resetAfterSilenceFrames: resetAfterSilenceFrames)
+                resetAfterSilenceFrames: resetAfterSilenceFrames,
+                computeUnits: SpeechComputeUnits(
+                    encoder: computeEncoder, decoder: computeDecoder))
         } else if stream {
             throw ValidationError(
                 "--stream needs a Parakeet TDT bundle directory. A single .aimodel is the "
@@ -227,7 +246,8 @@ struct SpeechRecognizer: AsyncParsableCommand {
 func runBundle(
     bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool, dumpMel: String? = nil,
     windowOverlap: Double = SpeechRecognitionModel.defaultOverlapSeconds,
-    resetAfterSilenceFrames: Int? = nil
+    resetAfterSilenceFrames: Int? = nil,
+    computeUnits: SpeechComputeUnits = .default
 ) async throws {
     // The architecture is printed after loading, once the bundle has reported it.
     // Detect an existing cached specialization before loading so we can annotate the load time
@@ -244,7 +264,8 @@ func runBundle(
     print("⏳ Preparing AI asset...", terminator: "")
     fflush(stdout)
     let loadStart = ContinuousClock.now
-    let model = try await SpeechRecognitionModel(resourcesAt: bundleURL)
+    let model = try await SpeechRecognitionModel(
+        resourcesAt: bundleURL, computeUnits: computeUnits)
     let loadElapsed = ContinuousClock.now - loadStart
     print(" done in \(String(format: "%.3f", loadElapsed.inSeconds))s\(cacheHit ? " (cache hit)" : "")")
     print("Format: bundle (\(await model.architecture))")
