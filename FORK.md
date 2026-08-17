@@ -55,6 +55,40 @@ CoreAIVisionLanguageModel.swift:32` has separate SDK drift (`missing argument la
 'capabilities:'`). Those are left alone — they do not affect `speech-recognizer`, but
 they do mean **`swift test` cannot build the full package** in this checkout.
 
+### Long-form audio: overlapping windows
+
+**Added:** `swift/Sources/CoreAISpeech/LongFormWindowing.swift`,
+`swift/Tests/SpeechTests/LongFormWindowingTests.swift`
+**Changed:** `SpeechRecognitionModel.transcribe`, `DecodeStats`, `SpeechRecognizerMain`
+
+Upstream decodes exactly one encoder window and silently discards the rest of the
+file: `MelSpectrogram.padToFrameGrid` truncates PCM to 480 000 samples and
+`decodeAudio` runs the encoder once, with no chunk loop anywhere. A 62 s file
+transcribed as its first 30 s, with nothing in the output to say so.
+
+`transcribe` now splits audio longer than the encoder's window into consecutive
+windows overlapping by `overlapSeconds` (default 2), decodes each, and joins the
+transcripts with the duplicated words at each seam removed. `DecodeStats.windowCount`
+reports the split and the CLI prints it. `--window-overlap` tunes it; `0` restores
+butted windows with no de-duplication.
+
+Measured on a 62.3 s clip: 3 windows, 200 steps, 3.1 s wall clock. Without the
+overlap the 30 s seam lands mid-sentence and six words are lost outright
+("My biological mother was a young,"); with it they are recovered and no duplicate
+4-gram appears anywhere in the output.
+
+This is the naive long-form strategy, one step up from the pre-fork
+`WhisperASR.swift`, which used fixed non-overlapping windows and documented the
+clipping. It is still weaker than Whisper's own algorithm, which emits timestamp
+tokens and advances to the end of the last complete segment — that would need
+timestamps in the forced prefix and a decode loop that reads them. Seam matching is
+also a heuristic: when the two windows transcribe the shared audio differently no
+run matches, and the text is concatenated rather than guessed at, so the failure
+mode is a repeated word rather than dropped speech.
+
+Windowing keys off `MelConfig.nFrames`, so a dynamic encoder (Parakeet's, unless
+exported at a static length) still takes the whole waveform in one pass.
+
 ### `swift/Sources/CoreAISpeech/SpeechRecognitionBundle.swift` — decoder pinned to CPU
 
 `WhisperDecoder` sends `position_ids` whose length grows by one per token, so every

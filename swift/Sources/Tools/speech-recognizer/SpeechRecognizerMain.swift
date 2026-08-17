@@ -69,6 +69,12 @@ struct SpeechRecognizer: AsyncParsableCommand {
 
     @Option(
         help:
+            "Seconds of audio shared between consecutive windows when the file is longer than one encoder window. The repeated words are removed when the transcripts are joined. 0 butts the windows together with no de-duplication."
+    )
+    var windowOverlap: Double = SpeechRecognitionModel.defaultOverlapSeconds
+
+    @Option(
+        help:
             "Write the computed mel features to this path as raw little-endian f32, plus a <path>.json sidecar with the shape. For front-end parity checks."
     )
     var dumpMel: String?
@@ -186,7 +192,8 @@ struct SpeechRecognizer: AsyncParsableCommand {
         } else if isBundle {
             try await runBundle(
                 bundleURL: bundleURL, audioPath: audioPath, warmup: warmup, verbose: verbose,
-                dumpMel: dumpMel, resetAfterSilenceFrames: resetAfterSilenceFrames)
+                dumpMel: dumpMel, windowOverlap: windowOverlap,
+                resetAfterSilenceFrames: resetAfterSilenceFrames)
         } else if stream {
             throw ValidationError(
                 "--stream needs a Parakeet TDT bundle directory. A single .aimodel is the "
@@ -219,6 +226,7 @@ struct SpeechRecognizer: AsyncParsableCommand {
 
 func runBundle(
     bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool, dumpMel: String? = nil,
+    windowOverlap: Double = SpeechRecognitionModel.defaultOverlapSeconds,
     resetAfterSilenceFrames: Int? = nil
 ) async throws {
     // The architecture is printed after loading, once the bundle has reported it.
@@ -273,7 +281,8 @@ func runBundle(
     if let audioURL { print("Transcribing \(audioURL.lastPathComponent)…") }
     let t0 = ContinuousClock.now
     let (text, stats) = try await model.transcribe(
-        pcm: pcm, resetAfterSilenceFrames: resetAfterSilenceFrames ?? 0)
+        pcm: pcm, overlapSeconds: windowOverlap,
+        resetAfterSilenceFrames: resetAfterSilenceFrames ?? 0)
     let totalTranscribeTime = (ContinuousClock.now - t0)
     let totalMs = totalTranscribeTime.inMilliseconds
     print("\n── Decode ─────────────────────────────────────────────────────────────")
@@ -283,6 +292,12 @@ func runBundle(
                 "  steps: %d  latency: %.1f ms/step  speed: %.1f steps/s  min: %.1f ms  max: %.1f ms  [%.1f ms total]",
             stats.stepCount, stats.avgLatencyMs, stats.stepsPerSecond,
             stats.minLatencyMs, stats.maxLatencyMs, totalMs))
+    // A static encoder sees a fixed span per pass, so long audio is decoded as
+    // several overlapping windows. Say so — silently transcribing part of a file
+    // is worse than transcribing all of it slowly.
+    if stats.windowCount > 1 {
+        print("  windows: \(stats.windowCount) (audio longer than one encoder window)")
+    }
     // Silence benchmark has no meaningful transcript to print.
     if audioURL != nil {
         print("\n── Transcription ──────────────────────────────────────────────────────")

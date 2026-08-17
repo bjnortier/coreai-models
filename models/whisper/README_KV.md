@@ -61,6 +61,10 @@ swift build --package-path swift -c release --product speech-recognizer
   --audio-path sample.wav --verbose
 ```
 
+Audio longer than 30 s is decoded as several overlapping windows; the decode line
+reports how many. `--window-overlap <seconds>` tunes the overlap (default 2, `0`
+disables both the overlap and the seam de-duplication).
+
 ## Bundle layout
 
 ```
@@ -177,9 +181,11 @@ pins the decoder to CPU. See [`FORK.md`](../../FORK.md).
 
 ## Limits
 
-- **30 s per window.** `MelConfig.whisper` pins 3000 mel frames and the runtime
-  pads or truncates PCM to 480 000 samples. Longer audio is silently truncated;
-  chunking is a runtime concern, not an export one.
+- **30 s per encoder pass.** `MelConfig.whisper` pins 3000 mel frames, so the encoder
+  sees exactly 480 000 samples per run — that is Whisper's architecture, not a runtime
+  choice. Longer audio is handled by the runtime, which splits it into overlapping
+  windows and stitches the transcripts; see [`FORK.md`](../../FORK.md). Nothing about
+  it is visible to the export.
 - **`whisper-large-v3`** has 32 decoder layers, so the packed encoder output is
   `[1, 1500, 81920]` ≈ 245 MB in fp16, passed as an input on every step. It exports,
   but turbo is the intended target.

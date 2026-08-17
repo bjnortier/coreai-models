@@ -17,6 +17,13 @@ import Tokenizers
 /// auto-detected from the bundle's metadata.json (or the legacy
 /// encoder/decoder filename convention for Whisper).
 public actor SpeechRecognitionModel {
+    /// Audio shared between consecutive windows when transcribing long-form audio.
+    ///
+    /// Long enough to contain a word or two of real speech at a normal speaking
+    /// rate, which is what seam matching needs to find its anchor. Longer costs
+    /// proportionally more decode time for no extra reliability.
+    public static let defaultOverlapSeconds: Double = 2.0
+
     package let bundle: SpeechRecognitionBundle
     package let decoder: any SpeechDecoder
     package let melConfig: MelConfig
@@ -127,25 +134,68 @@ public actor SpeechRecognitionModel {
 
     /// Transcribe an audio file, returning the full text and decode stats.
     ///
+    /// Audio longer than a static encoder's window is decoded as several
+    /// overlapping windows and stitched — see
+    /// ``transcribe(pcm:overlapSeconds:resetAfterSilenceFrames:)``.
     /// - Parameter resetAfterSilenceFrames: See `ParakeetTDTDecoder.decode`. 0 keeps this path
     ///   reference-exact.
     public func transcribe(
-        audioURL: URL, resetAfterSilenceFrames: Int = 0
+        audioURL: URL,
+        overlapSeconds: Double = SpeechRecognitionModel.defaultOverlapSeconds,
+        resetAfterSilenceFrames: Int = 0
     ) async throws -> (String, DecodeStats) {
-        let (tokens, stats) = try await decodeAudio(
-            from: audioURL, resetAfterSilenceFrames: resetAfterSilenceFrames)
-        return try (detokenize(tokens), stats)
+        let pcm = try MelSpectrogram.loadAndResample(
+            audioURL, targetSampleRate: melConfig.sampleRate)
+        return try await transcribe(
+            pcm: pcm, overlapSeconds: overlapSeconds,
+            resetAfterSilenceFrames: resetAfterSilenceFrames)
     }
 
     /// Transcribe raw 16 kHz mono PCM samples, returning the full text and decode stats.
     ///
-    /// - Parameter resetAfterSilenceFrames: See `transcribe(audioURL:resetAfterSilenceFrames:)`.
+    /// A static encoder sees a fixed span of audio per pass — Whisper's is 30 s —
+    /// so anything longer is split into consecutive windows that overlap by
+    /// `overlapSeconds`, decoded independently, and joined with the duplicated
+    /// words at each seam removed. `stats.windowCount` reports how many were used.
+    ///
+    /// Pass `0` to butt the windows against each other with no overlap and no
+    /// de-duplication. Bundles with a dynamic encoder (Parakeet's, unless exported
+    /// at a static length) take the whole waveform in one pass and ignore this.
+    /// - Parameter resetAfterSilenceFrames: See
+    ///   ``transcribe(audioURL:overlapSeconds:resetAfterSilenceFrames:)``. Applied
+    ///   per window: the predictor state does not cross a seam anyway, since each
+    ///   window is decoded independently.
     public func transcribe(
-        pcm: [Float], resetAfterSilenceFrames: Int = 0
+        pcm: [Float],
+        overlapSeconds: Double = SpeechRecognitionModel.defaultOverlapSeconds,
+        resetAfterSilenceFrames: Int = 0
     ) async throws -> (String, DecodeStats) {
-        let (tokens, stats) = try await decodeAudio(
-            pcm: pcm, resetAfterSilenceFrames: resetAfterSilenceFrames)
-        return try (detokenize(tokens), stats)
+        guard let windowSamples = staticWindowSamples, pcm.count > windowSamples else {
+            let (tokens, stats) = try await decodeAudio(
+                pcm: pcm, resetAfterSilenceFrames: resetAfterSilenceFrames)
+            return try (detokenize(tokens), stats)
+        }
+        let overlapSamples = Int(max(0, overlapSeconds) * melConfig.sampleRate)
+        let starts = LongForm.windowStarts(
+            pcmCount: pcm.count, windowSamples: windowSamples, overlapSamples: overlapSamples)
+
+        var texts: [String] = []
+        var stats: [DecodeStats] = []
+        for start in starts {
+            let end = min(start + windowSamples, pcm.count)
+            let (tokens, windowStats) = try await decodeAudio(
+                pcm: Array(pcm[start..<end]),
+                resetAfterSilenceFrames: resetAfterSilenceFrames)
+            texts.append(try detokenize(tokens))
+            stats.append(windowStats)
+        }
+        return (LongForm.stitch(texts), DecodeStats.merged(stats))
+    }
+
+    /// Samples the encoder consumes per pass, or `nil` when it accepts any length.
+    private var staticWindowSamples: Int? {
+        guard let nFrames = melConfig.nFrames else { return nil }
+        return nFrames * melConfig.hopLength
     }
 
     // MARK: - Parity Testing
@@ -174,6 +224,8 @@ public actor SpeechRecognitionModel {
     /// Recomputes the mel separately from `runEncoder`'s internal copy so the encoder
     /// path stays untouched; that costs one extra front-end pass, which is irrelevant
     /// on a verification path.
+    /// Single-window only: this captures one encoder pass, so PCM longer than a
+    /// static window is truncated as before. Parity checking compares one window.
     public func transcribeCapturingStages(pcm: [Float]) async throws -> StageCapture {
         let (melValues, melShape) = melFeatures(pcm: pcm)
         let (encOut, encShape, validEnc) = try await runEncoder(pcm: pcm)
@@ -272,13 +324,9 @@ public actor SpeechRecognitionModel {
         }
     }
 
-    private func decodeAudio(
-        from url: URL, resetAfterSilenceFrames: Int = 0
-    ) async throws -> ([Int32], DecodeStats) {
-        let pcm = try MelSpectrogram.loadAndResample(url, targetSampleRate: melConfig.sampleRate)
-        return try await decodeAudio(pcm: pcm, resetAfterSilenceFrames: resetAfterSilenceFrames)
-    }
-
+    /// Decodes exactly one encoder window. Long-form splitting happens in
+    /// ``transcribe(pcm:overlapSeconds:resetAfterSilenceFrames:)``, which needs
+    /// detokenized text to match the seams and so cannot stitch at this level.
     private func decodeAudio(
         pcm: [Float], resetAfterSilenceFrames: Int = 0
     ) async throws -> ([Int32], DecodeStats) {

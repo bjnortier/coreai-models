@@ -68,12 +68,45 @@ public struct DecodeStats: Sendable {
 
     public let firstStep: FirstStep?
 
+    /// How many audio windows this transcription decoded.
+    ///
+    /// A static encoder (Whisper's is fixed at 30 s) can only see one window per
+    /// pass, so longer audio is decoded as several. Surfaced so a caller can tell
+    /// a long-form result from a single-window one.
+    public let windowCount: Int
+
     public init(
-        stepTimesMs: [Double], coverage: Coverage = Coverage(), firstStep: FirstStep? = nil
+        stepTimesMs: [Double], coverage: Coverage = Coverage(), firstStep: FirstStep? = nil,
+        windowCount: Int = 1
     ) {
         self.stepTimesMs = stepTimesMs
         self.coverage = coverage
         self.firstStep = firstStep
+        self.windowCount = windowCount
+    }
+
+    /// Combines per-window stats from a long-form transcription.
+    ///
+    /// Step times concatenate and coverage counters sum, so the aggregate reads as
+    /// one decode. `firstStep` keeps the first window's tensors — it exists for
+    /// parity checking, which only ever inspects the first step of the first window.
+    package static func merged(_ parts: [DecodeStats]) -> DecodeStats {
+        if parts.count == 1 { return parts[0] }
+        var times: [Double] = []
+        var coverage = Coverage()
+        for part in parts {
+            times.append(contentsOf: part.stepTimesMs)
+            coverage.blankSkipReuses += part.coverage.blankSkipReuses
+            coverage.lstmStateAdvances += part.coverage.lstmStateAdvances
+            coverage.blankZeroDurationBreaks += part.coverage.blankZeroDurationBreaks
+            coverage.positiveDurationBreaks += part.coverage.positiveDurationBreaks
+            coverage.symbolCapExhaustions += part.coverage.symbolCapExhaustions
+            coverage.multiTokenSteps += part.coverage.multiTokenSteps
+            coverage.blankOnlySteps += part.coverage.blankOnlySteps
+        }
+        return DecodeStats(
+            stepTimesMs: times, coverage: coverage,
+            firstStep: parts.first?.firstStep, windowCount: max(1, parts.count))
     }
 
     public var stepCount: Int { stepTimesMs.count }
