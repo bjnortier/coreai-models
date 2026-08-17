@@ -111,7 +111,15 @@ public struct SpeechRecognitionBundle: Sendable {
                 "Whisper bundle at \(bundleURL.lastPathComponent) must contain encoder.aimodel and decoder.aimodel")
         }
         let encoder = try await AIModel(contentsOf: encURL)
-        let decoder = try await AIModel(contentsOf: decURL)
+        // The decoder step takes `position_ids` whose length grows by one per
+        // token, so every step presents a shape the accelerator backends have
+        // not specialized yet — ~300 ms of recompilation each, and the
+        // specialization cache does not survive the process. The CPU backend
+        // does not specialize per shape and runs this 4-layer, single-token
+        // graph in ~5 ms, so it is both simpler and ~300x faster here.
+        let decoder = try await AIModel(
+            contentsOf: decURL,
+            options: SpecializationOptions(preferredComputeUnitKind: .cpu))
         let cfgURL = bundleURL.appending(path: "generation_config.json")
         let generationConfig = (try? GenerationConfig(from: cfgURL)) ?? .whisper
         return WhisperAssets(
