@@ -1252,7 +1252,7 @@ private struct EngineImpl: ~Copyable {
 
         // Pre-grow KV cache
         let totalNeeded = prompt.count + maxTokens
-        try kvCache.ensureCapacity(forContextLength: totalNeeded, queue: pipelineQueue)
+        _ = try kvCache.ensureCapacity(forContextLength: totalNeeded, queue: pipelineQueue)
 
         // Prefill prompt (unconstrained -- grammar doesn't constrain the prompt)
         let prefillTokens: [Int32]

@@ -191,12 +191,12 @@ func zeroFillNDArray(_ array: inout NDArray) {
     case .float16, .bfloat16:
         var view = array.mutableView(as: Float16.self)
         view.withUnsafeMutablePointer { ptr, _, _ in
-            memset(ptr, 0, count * MemoryLayout<Float16>.size)
+            _ = memset(ptr, 0, count * MemoryLayout<Float16>.size)
         }
     case .float32:
         var view = array.mutableView(as: Float.self)
         view.withUnsafeMutablePointer { ptr, _, _ in
-            memset(ptr, 0, count * MemoryLayout<Float>.size)
+            _ = memset(ptr, 0, count * MemoryLayout<Float>.size)
         }
     default:
         preconditionFailure("Unsupported scalar type for state: \(array.scalarType)")

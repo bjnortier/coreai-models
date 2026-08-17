@@ -44,7 +44,7 @@ struct PipelinedTokenInputHandler {
                 .advanced(by: processedTokenCount)
             let tokenArray = Array(tokens)
             tokenArray.withUnsafeBufferPointer { src in
-                memcpy(dst, src.baseAddress!, tokenArray.count * MemoryLayout<Int32>.size)
+                _ = memcpy(dst, src.baseAddress!, tokenArray.count * MemoryLayout<Int32>.size)
             }
         }
 
