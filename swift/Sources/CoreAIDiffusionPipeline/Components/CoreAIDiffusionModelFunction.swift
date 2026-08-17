@@ -113,7 +113,7 @@ public actor CoreAIDiffusionModelFunction {
         switch scalarType {
         #if !((os(macOS) || targetEnvironment(macCatalyst)) && arch(x86_64))
         case .float16:
-            let view = array.mutableView(as: Float16.self)
+            var view = array.mutableView(as: Float16.self)
             view.withUnsafeMutablePointer { ptr, shape, strides in
                 fillStrided(ptr, data: data, shape: shape, strides: strides) { Float16($0) }
             }
@@ -129,7 +129,7 @@ public actor CoreAIDiffusionModelFunction {
             }
         #endif
         case .float32:
-            let view = array.mutableView(as: Float.self)
+            var view = array.mutableView(as: Float.self)
             view.withUnsafeMutablePointer { ptr, shape, strides in
                 fillStrided(ptr, data: data, shape: shape, strides: strides) { $0 }
             }

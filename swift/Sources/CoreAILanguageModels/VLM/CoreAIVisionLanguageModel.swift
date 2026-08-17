@@ -29,7 +29,7 @@ public struct CoreAIVisionLanguageModel: LanguageModel {
     public typealias Executor = CoreAIVLMExecutor
 
     public var capabilities: LanguageModelCapabilities {
-        LanguageModelCapabilities([.vision])
+        LanguageModelCapabilities(capabilities: [.vision])
     }
 
     public var executorConfiguration: CoreAIVLMExecutor.Configuration
