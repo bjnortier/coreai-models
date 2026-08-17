@@ -29,10 +29,49 @@ uv run export.py --help
 | `--model`          | Model variant                                  | `nvidia/parakeet-tdt-0.6b-v3` |
 | `--output-dir`     | Output directory for the bundle                | `<repo-root>/exports/`        |
 | `--dtype`          | `float16`, `float32`                           | `float32`                     |
-| `--dynamic`        | Encoder accepts variable audio length          | static (5s default)           |
-| `--audio-seconds`  | Length of dummy audio for static encoder trace (ignored with `--dynamic` or `--streaming`) | `5.0`                         |
+| `--dynamic`        | Encoder accepts variable audio length          | static (30s default)          |
+| `--audio-seconds`  | Length of dummy audio for static encoder trace (ignored with `--dynamic` or `--streaming`) | `30.0`                        |
 | `--overwrite`      | Overwrite existing bundle                      | —                             |
 | `--streaming`      | Fixed streaming window (see [Streaming](#streaming)) | —                       |
+
+### Static window vs. dynamic encoder
+
+**Use the default (static, 30 s) unless you have a specific reason not to.**
+
+A static export bakes one audio length into the encoder. The runtime pads shorter
+audio up to that window and splits longer audio into overlapping windows, so the
+window length sets how many encoder passes a file costs: at 30 s a one-minute clip
+is two passes, at 5 s it is twelve. That is why the default is 30 s.
+
+`--dynamic` sidesteps the split — the encoder accepts any length and the whole
+waveform goes through in one pass. That sounds like it should be faster, and it
+isn't: a dynamic graph is re-specialized for each new input length it sees, and that
+cost dominates. On a 62.3 s clip, float32, Apple silicon Mac:
+
+| | encoder | end-to-end | decode steps |
+| --- | ---: | ---: | ---: |
+| **static, 30 s (default)** | 3 × ~85.6 ms | **417 ms** | 358 |
+| dynamic | 678 ms (one pass) | 820 ms | 324 |
+
+The static export is ~2x faster end to end despite running the encoder three times,
+because its shape never changes and one specialization is reused for every window —
+and for every subsequent file. The dynamic graph pays that cost again on each new
+length, and the specialization cache does not survive the process.
+
+Two things the static path gives up:
+
+- **Seams.** Windows overlap by 2 s and the runtime removes the duplicated words
+  where they join, but that is a text-matching heuristic. When the two windows
+  transcribe the shared audio differently no run matches and the text is
+  concatenated rather than guessed at, so a word can repeat at a boundary. The
+  dynamic path has no seams at all.
+- **Re-decoding the overlap.** The 2 s shared between windows is decoded twice —
+  visible above as 358 steps against the dynamic path's 324.
+
+So prefer `--dynamic` when transcript quality at window boundaries matters more than
+latency, or when every input is the same length and the one-off specialization is
+paid once. Otherwise the default wins. Numbers are from one clip on one machine —
+re-measure before relying on them for a different platform, notably iOS.
 
 **Supported models:**
 

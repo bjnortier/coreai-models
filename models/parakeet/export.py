@@ -697,10 +697,12 @@ def main():
     parser.add_argument(
         "--audio-seconds",
         type=float,
-        default=5.0,
+        default=30.0,
         help=(
             "Length (seconds) of dummy audio used to shape the encoder's static "
-            "trace. Ignored when --dynamic or --streaming is set."
+            "trace. Ignored when --dynamic or --streaming is set. The runtime "
+            "pads or splits audio to this window, so a longer trace means fewer "
+            "encoder passes."
         ),
     )
     parser.add_argument(
