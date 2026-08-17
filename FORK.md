@@ -186,6 +186,50 @@ policy still gets a 26 ms encoder.
 
 ---
 
+## Known-benign warnings
+
+### `Tokenizer model class ParakeetTokenizer is not registered`
+
+Every Parakeet bundle load prints:
+
+```
+Warning: Tokenizer model class ParakeetTokenizer is not registered,
+falling back to a standard BPE implementation.
+```
+
+It is cosmetic, and for this model the fallback is exactly right. Investigated
+rather than assumed, so it does not get rediscovered:
+
+- The exported `processor/tokenizer_config.json` declares
+  `tokenizer_class: "ParakeetTokenizer"`. swift-transformers looks that name up in a
+  hardcoded table (`Tokenizer.swift:158-177`) and falls back with
+  `knownTokenizers[name] ?? BPETokenizer.self` (`:191`).
+- **The fallback picks the same class a registered entry would.** Almost every entry
+  in that table maps to `BPETokenizer.self` — Llama, Gemma, GPT2, Qwen2, Whisper,
+  CodeGen, Cohere, Falcon, Roberta, `PreTrainedTokenizer`. Only Bert, T5 and
+  XLM-Roberta differ. Parakeet's `tokenizer.json` carries `model.type: BPE`, so
+  registering `"ParakeetTokenizer": BPETokenizer.self` would change nothing but the
+  warning.
+- **The behaviour that matters is not chosen by the class.** The pre-tokenizer and
+  decoder come from `tokenizer.json` via
+  `DecoderFactory.fromConfig(config: tokenizerData["decoder"], …)`
+  (`Tokenizer.swift:531`). Parakeet's is `Metaspace` with replacement `▁`,
+  which is what turns those markers back into spaces — observably working, since
+  transcripts read `The quick brown fox` and not `▁The▁quick` or `Thequickbrown`.
+
+**The one real risk** is `strict` mode: the same code path *throws*
+`TokenizerError.unsupportedTokenizer` instead of warning (`Tokenizer.swift:193-197`).
+`SpeechRecognitionBundle` reaches it through `AutoTokenizer.from(modelFolder:)`, which
+is non-strict, so a Parakeet bundle loads. Any future caller taking the strict path
+would fail outright rather than warn.
+
+Fixing it properly means registering the class upstream in swift-transformers (a
+pinned dependency at 1.2.0). Rewriting `tokenizer_class` in the exported processor
+would silence it locally but make the bundle diverge from what HuggingFace emits, so
+it is deliberately not done.
+
+---
+
 ## Not yet ported from the pre-fork tree
 
 Work that exists in the older `coreai-models.obsolete` checkout (forked at `0c1055f`,
