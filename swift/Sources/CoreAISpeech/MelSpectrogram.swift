@@ -5,6 +5,7 @@
 
 import AVFoundation
 import Accelerate
+import CAccelerateBLAS
 import CoreAIShared
 import Foundation
 
@@ -286,20 +287,14 @@ public enum MelSpectrogram {
             } else {
                 // No radix-2 FFT for this nFFT (e.g. Whisper's 400 = 2⁴·5²) — evaluate
                 // the DFT as a dense matrix-vector product against the cos/sin tables.
-                cblas_sgemv(
-                    CblasRowMajor, CblasNoTrans,
-                    Int32(nFreqs), Int32(config.nFFT), 1.0, cosBasis, Int32(config.nFFT),
-                    frame, 1, 0.0, &yReal, 1)
-                cblas_sgemv(
-                    CblasRowMajor, CblasNoTrans,
-                    Int32(nFreqs), Int32(config.nFFT), 1.0, sinBasis, Int32(config.nFFT),
-                    frame, 1, 0.0, &yImag, 1)
+                caccel_sgemv_rowmajor(
+                    Int32(nFreqs), Int32(config.nFFT), cosBasis, frame, &yReal)
+                caccel_sgemv_rowmajor(
+                    Int32(nFreqs), Int32(config.nFFT), sinBasis, frame, &yImag)
                 vDSP_vmma(yReal, 1, yReal, 1, yImag, 1, yImag, 1, &powerSpec, 1, vDSP_Length(nFreqs))
             }
-            cblas_sgemv(
-                CblasRowMajor, CblasNoTrans,
-                Int32(config.nMelBins), Int32(nFreqs), 1.0, filterbank, Int32(nFreqs),
-                powerSpec, 1, 0.0, &melFrame, 1)
+            caccel_sgemv_rowmajor(
+                Int32(config.nMelBins), Int32(nFreqs), filterbank, powerSpec, &melFrame)
             for i in 0..<config.nMelBins {
                 let lv = useLog10 ? log10(max(melFrame[i], logFloor)) : log(melFrame[i] + logGuard)
                 let idx = (config.layout == .channelMajor) ? (i * totalFrames + t) : (t * config.nMelBins + i)

@@ -3,7 +3,7 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
-import Accelerate
+import CAccelerateBLAS
 
 /// Compute weighted sum of Float arrays of equal length using BLAS.
 func weightedSum(_ weights: [Float], _ values: [[Float]]) -> [Float] {
@@ -14,7 +14,7 @@ func weightedSum(_ weights: [Float], _ values: [[Float]]) -> [Float] {
     for i in 0..<values.count {
         let w = weights[i]
         values[i].withUnsafeBufferPointer { buf in
-            cblas_saxpy(Int32(count), w, buf.baseAddress, 1, &result, 1)
+            caccel_saxpy(Int32(count), w, buf.baseAddress, &result)
         }
     }
     return result

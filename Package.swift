@@ -102,6 +102,7 @@ let package = Package(
             name: "CoreAISpeech",
             dependencies: [
                 "CoreAIShared",
+                "CAccelerateBLAS",
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "swift/Sources/CoreAISpeech",
@@ -115,6 +116,7 @@ let package = Package(
             name: "CoreAIDiffusionPipeline",
             dependencies: [
                 "CoreAIShared",
+                "CAccelerateBLAS",
                 .product(name: "Transformers", package: "swift-transformers"),
             ],
             path: "swift/Sources/CoreAIDiffusionPipeline",
@@ -143,6 +145,21 @@ let package = Package(
             path: "swift/Sources/CoreAILMCommon",
             swiftSettings: [
                 .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+
+        // CBLAS shim: wraps deprecated classic CBLAS symbols behind the current
+        // ACCELERATE_NEW_LAPACK interface. The macro is a C-only cSetting (safe
+        // for published packages), unlike passing -Xcc from a Swift target.
+        .target(
+            name: "CAccelerateBLAS",
+            path: "swift/Sources/lib/CAccelerateBLAS",
+            publicHeadersPath: "include",
+            cSettings: [
+                .define("ACCELERATE_NEW_LAPACK")
+            ],
+            linkerSettings: [
+                .linkedFramework("Accelerate")
             ]
         ),
 
