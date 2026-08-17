@@ -191,6 +191,15 @@ struct SpeechRecognizer: AsyncParsableCommand {
             throw ValidationError("--model is required.")
         }
         let bundleURL = URL(fileURLWithPath: model)
+        // Diagnose the path before routing. Every way of getting this wrong
+        // otherwise ends up in `runLegacy`, which opens the path as a single asset
+        // and reports "malformed: Missing hash file" — which reads as a corrupt
+        // model whether the path is missing, a bundle short a metadata.json, or a
+        // plain typo.
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: bundleURL.path, isDirectory: &isDirectory) else {
+            throw ValidationError("--model path does not exist: \(bundleURL.path)")
+        }
         if clearCoreAICache {
             try clearCache(bundleURL: bundleURL)
         }
@@ -198,9 +207,22 @@ struct SpeechRecognizer: AsyncParsableCommand {
         // metadata.json. Both contain a metadata.json, so the extension has to be
         // checked first or `.aimodel` assets get misrouted to the bundle path.
         let assetExtensions: Set<String> = ["aimodel", "aimodelc"]
-        let isBundle =
-            !assetExtensions.contains(bundleURL.pathExtension)
-            && FileManager.default.fileExists(atPath: bundleURL.appending(path: "metadata.json").path)
+        let isAsset = assetExtensions.contains(bundleURL.pathExtension)
+        let hasMetadata = FileManager.default.fileExists(
+            atPath: bundleURL.appending(path: "metadata.json").path)
+        if isDirectory.boolValue, !isAsset, !hasMetadata {
+            let assets = (try? FileManager.default.contentsOfDirectory(atPath: bundleURL.path))?
+                .filter { assetExtensions.contains(URL(fileURLWithPath: $0).pathExtension) } ?? []
+            let hint =
+                assets.isEmpty
+                ? "It contains no .aimodel assets either — check the export completed."
+                : "It does contain \(assets.count) .aimodel asset(s): pass one directly, or "
+                    + "re-export so the bundle carries a metadata.json."
+            throw ValidationError(
+                "--model points at a directory with no metadata.json, so it cannot be loaded "
+                    + "as a bundle: \(bundleURL.path)\n\(hint)")
+        }
+        let isBundle = !isAsset && hasMetadata
         if isBundle, stream, let audioPath {
             try await runStreaming(
                 bundleURL: bundleURL, audioPath: audioPath, endpointFrames: endpointFrames,
