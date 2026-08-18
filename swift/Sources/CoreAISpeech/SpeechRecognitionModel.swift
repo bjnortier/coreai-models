@@ -147,12 +147,13 @@ public actor SpeechRecognitionModel {
     public func transcribe(
         audioURL: URL,
         overlapSeconds: Double = SpeechRecognitionModel.defaultOverlapSeconds,
+        language: SpeechLanguage = .detect,
         resetAfterSilenceFrames: Int = 0
     ) async throws -> (String, DecodeStats) {
         let pcm = try MelSpectrogram.loadAndResample(
             audioURL, targetSampleRate: melConfig.sampleRate)
         return try await transcribe(
-            pcm: pcm, overlapSeconds: overlapSeconds,
+            pcm: pcm, overlapSeconds: overlapSeconds, language: language,
             resetAfterSilenceFrames: resetAfterSilenceFrames)
     }
 
@@ -166,35 +167,109 @@ public actor SpeechRecognitionModel {
     /// Pass `0` to butt the windows against each other with no overlap and no
     /// de-duplication. Bundles with a dynamic encoder (Parakeet's, unless exported
     /// at a static length) take the whole waveform in one pass and ignore this.
+    /// - Parameter language: which language to decode as. Defaults to detecting it
+    ///   from the audio; pass ``SpeechLanguage/code(_:)`` to force one, or
+    ///   ``SpeechLanguage/bundleDefault`` to keep whatever the export pinned.
+    ///   Ignored by Parakeet, which decodes multilingual audio directly.
     /// - Parameter resetAfterSilenceFrames: See
-    ///   ``transcribe(audioURL:overlapSeconds:resetAfterSilenceFrames:)``. Applied
-    ///   per window: the predictor state does not cross a seam anyway, since each
-    ///   window is decoded independently.
+    ///   ``transcribe(audioURL:overlapSeconds:language:resetAfterSilenceFrames:)``.
+    ///   Applied per window: the predictor state does not cross a seam anyway,
+    ///   since each window is decoded independently.
     public func transcribe(
         pcm: [Float],
         overlapSeconds: Double = SpeechRecognitionModel.defaultOverlapSeconds,
+        language: SpeechLanguage = .detect,
         resetAfterSilenceFrames: Int = 0
     ) async throws -> (String, DecodeStats) {
         guard let windowSamples = staticWindowSamples, pcm.count > windowSamples else {
+            let resolved = try await resolvedResources(forLeadingPCM: pcm, language: language)
             let (tokens, stats) = try await decodeAudio(
-                pcm: pcm, resetAfterSilenceFrames: resetAfterSilenceFrames)
+                pcm: pcm, resources: resolved,
+                resetAfterSilenceFrames: resetAfterSilenceFrames)
             return try (detokenize(tokens), stats)
         }
         let overlapSamples = Int(max(0, overlapSeconds) * melConfig.sampleRate)
         let starts = LongForm.windowStarts(
             pcmCount: pcm.count, windowSamples: windowSamples, overlapSamples: overlapSamples)
 
+        // Detect once, on the first window, and reuse it for the rest: a recording
+        // is almost always one language, and re-detecting per window would both
+        // cost a step each time and let a noisy window flip the language
+        // mid-transcript, producing a hybrid transcript from a monolingual file.
+        let firstEnd = min(starts[0] + windowSamples, pcm.count)
+        let resolved = try await resolvedResources(
+            forLeadingPCM: Array(pcm[starts[0]..<firstEnd]), language: language)
+
         var texts: [String] = []
         var stats: [DecodeStats] = []
         for start in starts {
             let end = min(start + windowSamples, pcm.count)
             let (tokens, windowStats) = try await decodeAudio(
-                pcm: Array(pcm[start..<end]),
+                pcm: Array(pcm[start..<end]), resources: resolved,
                 resetAfterSilenceFrames: resetAfterSilenceFrames)
             texts.append(try detokenize(tokens))
             stats.append(windowStats)
         }
         return (LongForm.stitch(texts), DecodeStats.merged(stats))
+    }
+
+    /// The language this request would decode as, as a code such as `"fr"`.
+    ///
+    /// `nil` for bundles that do not select a language (Parakeet).
+    public func resolveLanguage(
+        pcm: [Float], language: SpeechLanguage = .detect
+    ) async throws -> String? {
+        let resolved = try await resolvedResources(forLeadingPCM: pcm, language: language)
+        guard case .whisper(_, let config) = resolved, let token = config.languageToken else {
+            return nil
+        }
+        return bundle.languageTokens.codeByID[token]
+    }
+
+    /// The decoder resources for this request, with the language resolved.
+    ///
+    /// Detection runs the decoder once over `leadingPCM`, so it happens a single
+    /// time per transcription rather than per window.
+    private func resolvedResources(
+        forLeadingPCM leadingPCM: [Float], language: SpeechLanguage
+    ) async throws -> DecoderResources {
+        guard case .whisper(let decoderModel, let config) = resources else {
+            return resources  // Parakeet decodes multilingual audio directly.
+        }
+        let table = bundle.languageTokens
+
+        switch language {
+        case .bundleDefault:
+            return resources
+
+        case .code(let code):
+            guard let token = table.token(for: code) else {
+                throw SpeechError.incompatibleResources(
+                    table.isEmpty
+                        ? "This bundle ships no token table, so a language cannot be selected."
+                        : "This bundle has no token for language '\(code)'.")
+            }
+            return .whisper(
+                decoder: decoderModel,
+                generationConfig: config.retargeted(toLanguageToken: token))
+
+        case .detect:
+            // With no token table there is nothing to choose between; fall back to
+            // the bundle's pin rather than failing the transcription.
+            guard !table.isEmpty, let whisper = decoder as? WhisperDecoder else {
+                return resources
+            }
+            let (encOut, encShape, _) = try await runEncoder(pcm: leadingPCM)
+            guard let detected = try await whisper.detectLanguageToken(
+                encoderOutput: encOut,
+                encoderOutputShape: encShape,
+                resources: resources,
+                candidates: Set(table.codeByID.keys))
+            else { return resources }
+            return .whisper(
+                decoder: decoderModel,
+                generationConfig: config.retargeted(toLanguageToken: detected))
+        }
     }
 
     /// Samples the encoder consumes per pass, or `nil` when it accepts any length.
@@ -330,12 +405,13 @@ public actor SpeechRecognitionModel {
     }
 
     /// Decodes exactly one encoder window. Long-form splitting happens in
-    /// ``transcribe(pcm:overlapSeconds:resetAfterSilenceFrames:)``, which needs
-    /// detokenized text to match the seams and so cannot stitch at this level.
+    /// ``transcribe(pcm:overlapSeconds:language:resetAfterSilenceFrames:)``, which needs detokenized text
+    /// to match the seams and so cannot stitch at this level.
     private func decodeAudio(
-        pcm: [Float], resetAfterSilenceFrames: Int = 0
+        pcm: [Float], resources: DecoderResources? = nil, resetAfterSilenceFrames: Int = 0
     ) async throws -> ([Int32], DecodeStats) {
         let (encOut, encShape, validEnc) = try await runEncoder(pcm: pcm)
+        let effectiveResources = resources ?? self.resources
         // Not on `SpeechDecoder`, so reached by downcast the way `startStream` does. Thrown
         // rather than ignored elsewhere: silently dropping a flag the caller passed is how a
         // missed effect reads as a clean run.
@@ -349,14 +425,14 @@ public actor SpeechRecognitionModel {
                 encoderOutput: encOut,
                 encoderOutputShape: encShape,
                 validEncoderFrames: validEnc,
-                resources: resources,
+                resources: effectiveResources,
                 resetAfterSilenceFrames: resetAfterSilenceFrames)
         }
         return try await decoder.decode(
             encoderOutput: encOut,
             encoderOutputShape: encShape,
             validEncoderFrames: validEnc,
-            resources: resources)
+            resources: effectiveResources)
     }
 
     /// How many leading encoder frames carry real audio.

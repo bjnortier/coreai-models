@@ -86,6 +86,11 @@ public struct SpeechComputeUnits: Sendable, Equatable {
 
 public struct SpeechRecognitionBundle: Sendable {
     public let kind: Kind
+
+    /// The `<|xx|>` language tokens this bundle understands, for selecting or
+    /// detecting a decode language. Empty for bundles that ship no token table
+    /// (Parakeet, which needs none).
+    let languageTokens: WhisperLanguageTokens
     public let tokenizer: (any Tokenizer)?
 
     public enum Kind: Sendable {
@@ -123,6 +128,7 @@ public struct SpeechRecognitionBundle: Sendable {
         let metadataURL = url.appending(path: "metadata.json")
         if FileManager.default.fileExists(atPath: metadataURL.path) {
             let bundle = try ModelBundle(at: url)
+            self.languageTokens = WhisperLanguageTokens(bundleURL: url)
             switch bundle.kind {
             case .speechRecognizer:
                 switch Self.architecture(from: bundle.raw) {
@@ -145,6 +151,7 @@ public struct SpeechRecognitionBundle: Sendable {
             return
         }
         // Legacy Whisper bundle (no metadata.json).
+        self.languageTokens = WhisperLanguageTokens(bundleURL: url)
         let assets = try await Self.loadWhisper(bundleURL: url, computeUnits: computeUnits)
         self.kind = .whisper(assets)
         self.tokenizer = try? await Self.loadWhisperTokenizer(
@@ -337,7 +344,32 @@ public struct GenerationConfig: Sendable {
         tokenizerName: "openai/whisper-large-v3-turbo"
     )
 
-    init(forcedPrefix: [Int32], eotToken: Int32, maxDecodeSteps: Int, tokenizerName: String?) {
+    /// The Whisper decoder prefix is `[<|startoftranscript|>, <|lang|>, <|task|>, …]`,
+    /// so the language occupies slot 1.
+    static let languagePrefixIndex = 1
+
+    /// The language token this config pins, if its prefix has one.
+    public var languageToken: Int32? {
+        forcedPrefix.count > Self.languagePrefixIndex ? forcedPrefix[Self.languagePrefixIndex] : nil
+    }
+
+    /// A copy of this config that decodes as the language `token` names.
+    ///
+    /// Only the language slot changes; the task and timestamp tokens the bundle
+    /// was exported with are preserved.
+    public func retargeted(toLanguageToken token: Int32) -> GenerationConfig {
+        guard forcedPrefix.count > Self.languagePrefixIndex else { return self }
+        var prefix = forcedPrefix
+        prefix[Self.languagePrefixIndex] = token
+        return GenerationConfig(
+            forcedPrefix: prefix,
+            eotToken: eotToken,
+            maxDecodeSteps: maxDecodeSteps,
+            tokenizerName: tokenizerName
+        )
+    }
+
+    public init(forcedPrefix: [Int32], eotToken: Int32, maxDecodeSteps: Int, tokenizerName: String?) {
         self.forcedPrefix = forcedPrefix
         self.eotToken = eotToken
         self.maxDecodeSteps = maxDecodeSteps

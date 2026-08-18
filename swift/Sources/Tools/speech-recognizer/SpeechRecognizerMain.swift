@@ -84,6 +84,9 @@ struct SpeechRecognizer: AsyncParsableCommand {
     )
     var computeDecoder: SpeechComputeUnit = SpeechComputeUnits.default.decoder
 
+    @Option(name: .long, help: "Language to transcribe as: a code such as 'fr', 'auto' to detect it from the audio (the default), or 'bundle' to use whatever the export pinned. A Whisper export pins a language and otherwise transcribes other languages as if they were it.")
+    var language: String = "auto"
+
     @Option(
         help:
             "Seconds of audio shared between consecutive windows when the file is longer than one encoder window. The repeated words are removed when the transcripts are joined. 0 butts the windows together with no de-duplication."
@@ -234,7 +237,8 @@ struct SpeechRecognizer: AsyncParsableCommand {
                 dumpMel: dumpMel, windowOverlap: windowOverlap,
                 resetAfterSilenceFrames: resetAfterSilenceFrames,
                 computeUnits: SpeechComputeUnits(
-                    encoder: computeEncoder, decoder: computeDecoder))
+                    encoder: computeEncoder, decoder: computeDecoder),
+                language: Self.parseLanguage(language))
         } else if stream {
             throw ValidationError(
                 "--stream needs a Parakeet TDT bundle directory. A single .aimodel is the "
@@ -249,6 +253,15 @@ struct SpeechRecognizer: AsyncParsableCommand {
                         + "single .aimodel is the legacy Whisper layout, which has none.")
             }
             try await runLegacy(model: model, audioPath: audioPath, warmup: warmup)
+        }
+    }
+
+    /// Maps the `--language` flag onto a ``SpeechLanguage``.
+    static func parseLanguage(_ value: String) -> SpeechLanguage {
+        switch value.lowercased() {
+        case "auto", "detect": return .detect
+        case "bundle", "default": return .bundleDefault
+        default: return .code(value)
         }
     }
 
@@ -269,7 +282,8 @@ func runBundle(
     bundleURL: URL, audioPath: String?, warmup: Bool, verbose: Bool, dumpMel: String? = nil,
     windowOverlap: Double = SpeechRecognitionModel.defaultOverlapSeconds,
     resetAfterSilenceFrames: Int? = nil,
-    computeUnits: SpeechComputeUnits = .default
+    computeUnits: SpeechComputeUnits = .default,
+    language: SpeechLanguage = .detect
 ) async throws {
     // The architecture is printed after loading, once the bundle has reported it.
     // Detect an existing cached specialization before loading so we can annotate the load time
@@ -324,7 +338,7 @@ func runBundle(
     if let audioURL { print("Transcribing \(audioURL.lastPathComponent)…") }
     let t0 = ContinuousClock.now
     let (text, stats) = try await model.transcribe(
-        pcm: pcm, overlapSeconds: windowOverlap,
+        pcm: pcm, overlapSeconds: windowOverlap, language: language,
         resetAfterSilenceFrames: resetAfterSilenceFrames ?? 0)
     let totalTranscribeTime = (ContinuousClock.now - t0)
     let totalMs = totalTranscribeTime.inMilliseconds
@@ -340,6 +354,18 @@ func runBundle(
     // is worse than transcribing all of it slowly.
     if stats.windowCount > 1 {
         print("  windows: \(stats.windowCount) (audio longer than one encoder window)")
+    }
+    // Say which language was decoded. A Whisper export transcribes other languages
+    // as if they were its pinned one rather than failing, so a wrong language reads
+    // as a fluent but incorrect transcript unless it is reported.
+    if let resolved = try? await model.resolveLanguage(pcm: pcm, language: language) {
+        let how: String
+        switch language {
+        case .detect: how = "detected"
+        case .code: how = "requested"
+        case .bundleDefault: how = "pinned by the bundle"
+        }
+        print("  language: \(resolved) (\(how))")
     }
     // Report the end-to-end figure separately from the decoder-step statistics
     // above. Printing the wall clock inside the "Decode" section read as though

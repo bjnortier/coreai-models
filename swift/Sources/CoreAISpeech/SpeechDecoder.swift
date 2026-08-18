@@ -137,6 +137,71 @@ public protocol SpeechDecoder: Sendable {
 public struct WhisperDecoder: SpeechDecoder {
     public init() {}
 
+    /// Predicts the spoken language from one decoder step.
+    ///
+    /// Whisper's first prediction after `<|startoftranscript|>` is the language
+    /// token, so detection is a single step: prime the cache with SOT, then take
+    /// the argmax over the language tokens only. Restricting the argmax matters —
+    /// unrestricted, the highest-scoring token at that position is frequently a
+    /// text token rather than a language tag.
+    ///
+    /// Returns `nil` when the candidate set is empty, leaving the caller to fall
+    /// back to the bundle's pinned language.
+    public func detectLanguageToken(
+        encoderOutput: NDArray,
+        encoderOutputShape: [Int],
+        resources: DecoderResources,
+        candidates: Set<Int32>
+    ) async throws -> Int32? {
+        guard !candidates.isEmpty else { return nil }
+        guard case .whisper(let decoderModel, let config) = resources else {
+            throw SpeechError.incompatibleResources("WhisperDecoder requires .whisper resources")
+        }
+        guard let startToken = config.forcedPrefix.first else { return nil }
+        guard let decFn = try decoderModel.loadFunction(named: "main"),
+            let decDesc = decoderModel.functionDescriptor(for: "main")
+        else { throw SpeechError.missingModel("No 'main' function in decoder") }
+
+        guard case .ndArray(let inputIdsNDDesc) = decDesc.inputDescriptor(of: "input_ids"),
+            case .ndArray(let posIdsNDDesc) = decDesc.inputDescriptor(of: "position_ids"),
+            case .ndArray(let keyCacheNDDesc) = decDesc.stateDescriptor(of: "keyCache"),
+            case .ndArray(let valCacheNDDesc) = decDesc.stateDescriptor(of: "valueCache"),
+            case .ndArray(let logitsNDDesc) = decDesc.outputDescriptor(of: "logits")
+        else { throw SpeechError.missingModel("Unexpected decoder descriptors") }
+
+        let vocabSize = logitsNDDesc.shape.last!
+        let maxTargetPos = 448
+        var keyCache = NDArray(
+            descriptor: keyCacheNDDesc.resolvingDynamicDimensions(
+                keyCacheNDDesc.shape.map { $0 < 0 ? maxTargetPos : $0 }))
+        var valueCache = NDArray(
+            descriptor: valCacheNDDesc.resolvingDynamicDimensions(
+                valCacheNDDesc.shape.map { $0 < 0 ? maxTargetPos : $0 }))
+        var logitsArray = NDArray(
+            descriptor: logitsNDDesc.resolvingDynamicDimensions([1, 1, vocabSize]))
+
+        var ids = NDArray(descriptor: inputIdsNDDesc.resolvingDynamicDimensions([1, 1]))
+        var posIds = NDArray(descriptor: posIdsNDDesc.resolvingDynamicDimensions([1, 1]))
+        fillNDArray(&ids, as: Int32.self, with: [startToken])
+        fillNDArray(&posIds, as: Int32.self, count: 1) { Int32($0) }
+        var st = InferenceFunction.MutableViews()
+        st.insert(&keyCache, for: "keyCache")
+        st.insert(&valueCache, for: "valueCache")
+        var out = InferenceFunction.MutableViews()
+        out.insert(&logitsArray, for: "logits")
+        _ = try await decFn.run(
+            inputs: [
+                "input_ids": ids, "position_ids": posIds,
+                "encoder_hidden_states": encoderOutput,
+            ],
+            states: consume st, outputViews: consume out)
+
+        let logits = flattenAsFloat(logitsArray)
+        return candidates
+            .filter { $0 >= 0 && Int($0) < logits.count }
+            .max { logits[Int($0)] < logits[Int($1)] }
+    }
+
     public func decode(
         encoderOutput: NDArray,
         encoderOutputShape: [Int],

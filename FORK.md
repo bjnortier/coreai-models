@@ -186,6 +186,72 @@ policy still gets a 26 ms encoder.
 
 ---
 
+### Whisper language selection and detection
+
+**Changed:** `swift/Sources/CoreAISpeech/SpeechRecognitionModel.swift`,
+`swift/Sources/CoreAISpeech/SpeechRecognitionBundle.swift`,
+`swift/Sources/CoreAISpeech/SpeechDecoder.swift`,
+`swift/Sources/Tools/speech-recognizer/SpeechRecognizerMain.swift`
+**Added:** `swift/Sources/CoreAISpeech/SpeechLanguage.swift`,
+`swift/Tests/SpeechTests/SpeechLanguageTests.swift`
+
+A Whisper export carries its decode language in the forced decoder prefix from
+`generation_config.json` — `<|startoftranscript|><|en|><|transcribe|>` — and
+upstream offers no way to change it. That is not a graceful limitation: fed
+French audio, an `<|en|>` export does not fail, it transcribes the audio *as if*
+it were English and emits a fluent English translation. Measured on a French
+clip, the same bundle scored 96% WER against a French reference while whisper.cpp,
+Parakeet and Apple all scored 11%. Nothing in the output says the language was
+wrong.
+
+`transcribe(pcm:overlapSeconds:language:)` now takes a `SpeechLanguage`:
+
+- `.detect` (**the default**) — predicts the language from the audio.
+- `.code("fr")` — decode as that language; accepts `"fr"`, `"fr-FR"` or `"fr_FR"`.
+- `.bundleDefault` — whatever the export pinned, i.e. the previous behaviour.
+
+Detection is one decoder step: Whisper's first prediction after
+`<|startoftranscript|>` *is* the language token, so `WhisperDecoder.detectLanguageToken`
+primes the cache with the start token and takes the argmax **restricted to the
+language tokens**. The restriction is load-bearing — unrestricted, the top token
+at that position is frequently ordinary text. Cost is ~110 ms on a 62 s clip
+(1390 ms → 1500 ms end to end).
+
+For long-form audio the language is detected **once, on the first window**, and
+reused. A recording is almost always one language, and per-window detection would
+both cost a step each time and let a noisy window flip the language mid-file.
+
+Language tokens are read from the bundle's own `added_tokens.json` (falling back
+to `vocab.json`) rather than hardcoded: the set and numbering differ between
+Whisper generations, and language tags are separable from control tokens by being
+two- or three-letter codes. A bundle with no token table falls back to its pin
+rather than failing, which is how Parakeet — natively multilingual, and ignoring
+this entirely — behaves.
+
+`GenerationConfig` gained `languageToken` and `retargeted(toLanguageToken:)`,
+which replaces only prefix slot 1 so the export's task and timestamp tokens
+survive, and its memberwise initializer is now public.
+
+`speech-recognizer` gained `--language` (`auto` | `bundle` | a code) and reports
+which language it used and how it was chosen:
+
+```
+$ speech-recognizer --model exports/whisper-large-v3-turbo-kv_float16 --audio-path fr.wav
+  language: fr (detected)
+  Malheureusement, l'étude du flux de circulation est difficile car …
+
+$ … --language bundle
+  language: en (pinned by the bundle)
+  Unfortunately, the study of circulation is difficult because …
+```
+
+**Rebase note:** the default changed from the bundle's pin to detection, so a
+caller that relied on always decoding as the pinned language must now pass
+`.bundleDefault` explicitly. `transcribeCapturingStages(pcm:)` is untouched and
+still uses the pinned prefix, so the PyTorch parity traces are unaffected.
+
+---
+
 ### `speech-recognizer`: decode statistics vs end-to-end time
 
 **Changed:** `swift/Sources/Tools/speech-recognizer/SpeechRecognizerMain.swift`
