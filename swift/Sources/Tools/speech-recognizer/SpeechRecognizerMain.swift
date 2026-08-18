@@ -332,15 +332,27 @@ func runBundle(
     print(
         String(
             format:
-                "  steps: %d  latency: %.1f ms/step  speed: %.1f steps/s  min: %.1f ms  max: %.1f ms  [%.1f ms total]",
+                "  steps: %d  latency: %.1f ms/step  speed: %.1f steps/s  min: %.1f ms  max: %.1f ms",
             stats.stepCount, stats.avgLatencyMs, stats.stepsPerSecond,
-            stats.minLatencyMs, stats.maxLatencyMs, totalMs))
+            stats.minLatencyMs, stats.maxLatencyMs))
     // A static encoder sees a fixed span per pass, so long audio is decoded as
     // several overlapping windows. Say so — silently transcribing part of a file
     // is worse than transcribing all of it slowly.
     if stats.windowCount > 1 {
         print("  windows: \(stats.windowCount) (audio longer than one encoder window)")
     }
+    // Report the end-to-end figure separately from the decoder-step statistics
+    // above. Printing the wall clock inside the "Decode" section read as though
+    // decoding accounted for all of it; on a 3-window file it is closer to two
+    // thirds, the rest being the mel spectrogram and the encoder passes. Print
+    // the share so the split is visible rather than inferred.
+    let decodeMs = stats.stepTimesMs.reduce(0, +)
+    print("\n── Timing ─────────────────────────────────────────────────────────────")
+    print(String(format: "  transcribe: %8.1f ms   mel + encoder + decode, end to end", totalMs))
+    print(
+        String(
+            format: "  decode:     %8.1f ms   sum of the %d steps above (%.0f%% of total)",
+            decodeMs, stats.stepCount, totalMs > 0 ? decodeMs / totalMs * 100 : 0))
     // Silence benchmark has no meaningful transcript to print.
     if audioURL != nil {
         print("\n── Transcription ──────────────────────────────────────────────────────")

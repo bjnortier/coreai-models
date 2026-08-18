@@ -186,6 +186,35 @@ policy still gets a 26 ms encoder.
 
 ---
 
+### `speech-recognizer`: decode statistics vs end-to-end time
+
+**Changed:** `swift/Sources/Tools/speech-recognizer/SpeechRecognizerMain.swift`
+
+The bundle path printed the wall clock for the whole `transcribe(pcm:)` call as
+`[… ms total]` on the end of the **Decode** line, next to the per-step statistics.
+Read naturally that says decoding accounts for all of it, when on a multi-window
+file the decoder steps are around two thirds and the rest is the mel spectrogram
+and the encoder passes.
+
+Split into two sections: `Decode` keeps the step statistics, and a new `Timing`
+section reports the end-to-end figure alongside the summed step time and its
+share of the total.
+
+```
+── Decode ─────
+  steps: 200  latency: 6.9 ms/step  speed: 144.3 steps/s  min: 5.0 ms  max: 9.2 ms
+  windows: 3 (audio longer than one encoder window)
+
+── Timing ─────
+  transcribe:   2132.6 ms   mel + encoder + decode, end to end
+  decode:       1386.2 ms   sum of the 200 steps above (65% of total)
+```
+
+The legacy monolithic path was already unambiguous — it reports step statistics
+and no total — and is unchanged.
+
+---
+
 ## Known-benign warnings
 
 ### `Tokenizer model class ParakeetTokenizer is not registered`
