@@ -115,8 +115,10 @@ struct BFloat16FlattenTests {
         let expected: [Float] = [1.0, -2.0, 0.5]
 
         var array = NDArray(shape: [3], scalarType: .bfloat16)
-        array.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
-            let dst = ptr.assumingMemoryBound(to: UInt16.self)
+        var rawView = array.mutableRawView()
+        var bytes = rawView.mutableBytes
+        bytes.withUnsafeMutableBytes { raw in
+            let dst = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
             for i in 0..<3 { dst[i] = bf16Values[i] }
         }
 
@@ -127,8 +129,10 @@ struct BFloat16FlattenTests {
     @Test("flattenAsFloat dispatches bfloat16 correctly")
     func flattenAsFloatBF16() {
         var array = NDArray(shape: [2], scalarType: .bfloat16)
-        array.mutableRawView().withUnsafeMutableBytes { ptr, _, _ in
-            let dst = ptr.assumingMemoryBound(to: UInt16.self)
+        var rawView = array.mutableRawView()
+        var bytes = rawView.mutableBytes
+        bytes.withUnsafeMutableBytes { raw in
+            let dst = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
             dst[0] = 0x4040  // 3.0 in bf16
             dst[1] = 0x4080  // 4.0 in bf16
         }

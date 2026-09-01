@@ -213,15 +213,28 @@ public func flattenBFloat16NDArray(_ array: NDArray) -> [Float] {
     let outerShape = array.shape
     let total = outerShape.reduce(1, *)
     var result = [Float](repeating: 0, count: total)
-    array.rawView().withUnsafeBytes { ptr, shape, strides in
-        let src = ptr.assumingMemoryBound(to: UInt16.self)
-        if isContiguousRowMajor(shape: shape, strides: strides) {
+    // Read the bytes untyped. Under the macOS 27 beta SDK `rawView().withUnsafeBytes` is
+    // gone, and neither `NDArray.view(as:)` nor `RawView.view(as:)` is usable here: both
+    // assert the element type matches the array's scalar type, and `BFloat16` is not a
+    // public type, so a bfloat16 array cannot be viewed as itself from outside the
+    // runtime. `RawSpan` is the one door that does not type-check.
+    let rawView = array.rawView()
+    let rank = rawView.shape.count
+    let contiguous = isContiguousRowMajor(shape: rawView.shape, strides: rawView.strides)
+    var shape = [Int](repeating: 0, count: rank)
+    var strides = [Int](repeating: 0, count: rank)
+    for d in 0..<rank {
+        shape[d] = rawView.shape[d]
+        strides[d] = rawView.strides[d]
+    }
+    rawView.bytes.withUnsafeBytes { raw in
+        let src = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
+        if contiguous {
             for i in 0..<total {
                 result[i] = Float(bitPattern: UInt32(src[i]) << 16)
             }
             return
         }
-        let rank = shape.count
         var indices = [Int](repeating: 0, count: rank)
         for i in 0..<total {
             var offset = 0

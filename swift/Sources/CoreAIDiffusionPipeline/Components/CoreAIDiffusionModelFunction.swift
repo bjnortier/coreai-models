@@ -118,8 +118,18 @@ public actor CoreAIDiffusionModelFunction {
                 fillStrided(ptr, data: data, shape: shape, strides: strides) { Float16($0) }
             }
         case .bfloat16:
-            array.mutableRawView().withUnsafeMutableBytes { ptr, shape, strides in
-                let dst = ptr.assumingMemoryBound(to: UInt16.self)
+            // Untyped, because under the macOS 27 beta SDK `withUnsafeMutableBytes` is gone
+            // from `MutableRawView` and every typed view — `NDArray.mutableView(as:)` and
+            // `MutableRawView.view(as:)` alike — asserts the element type matches the
+            // array's scalar type. `BFloat16` is not a public type, so a bfloat16 array
+            // cannot be viewed as itself from outside the runtime; `MutableRawSpan` is the
+            // one door that does not type-check.
+            var rawView = array.mutableRawView()
+            let shape = spanToArray(rawView.shape)
+            let strides = spanToArray(rawView.strides)
+            var bytes = rawView.mutableBytes
+            bytes.withUnsafeMutableBytes { raw in
+                let dst = raw.baseAddress!.assumingMemoryBound(to: UInt16.self)
                 fillStrided(dst, data: data, shape: shape, strides: strides) { val in
                     let bits = val.bitPattern
                     let lsb = (bits >> 16) & 1
@@ -310,6 +320,15 @@ public actor CoreAIDiffusionModelFunction {
     // MARK: - Stride-aware fill/read helpers
 
     /// Fill an NDArray buffer respecting non-contiguous strides.
+    /// `Span` is non-escapable, so a caller holding a raw byte span cannot also pass one
+    /// through. Copying the (tiny, rank-length) shape out first is what lets both the typed
+    /// and the untyped fill paths share one implementation.
+    private static func spanToArray(_ span: Span<Int>) -> [Int] {
+        var out = [Int](repeating: 0, count: span.count)
+        for d in 0..<span.count { out[d] = span[d] }
+        return out
+    }
+
     private static func fillStrided<T>(
         _ ptr: UnsafeMutablePointer<T>,
         data: [Float],
@@ -317,12 +336,33 @@ public actor CoreAIDiffusionModelFunction {
         strides: Span<Int>,
         convert: (Float) -> T
     ) {
+        fillStrided(
+            ptr, data: data, shape: spanToArray(shape), strides: spanToArray(strides),
+            convert: convert)
+    }
+
+    private static func fillStrided<T>(
+        _ ptr: UnsafeMutablePointer<T>,
+        data: [Float],
+        shape: [Int],
+        strides: [Int],
+        convert: (Float) -> T
+    ) {
         let ndim = shape.count
         if ndim <= 1 {
             for j in 0..<data.count { ptr[j] = convert(data[j]) }
             return
         }
-        if isContiguousRowMajor(shape: shape, strides: strides) {
+        var expectedStride = 1
+        var contiguous = true
+        for d in (0..<ndim).reversed() {
+            if strides[d] != expectedStride {
+                contiguous = false
+                break
+            }
+            expectedStride *= shape[d]
+        }
+        if contiguous {
             for j in 0..<data.count { ptr[j] = convert(data[j]) }
             return
         }
