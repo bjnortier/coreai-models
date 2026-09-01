@@ -4,7 +4,12 @@ This fork of [`apple/coreai-models`](https://github.com/apple/coreai-models) tra
 upstream `main` and adds work that is not upstream. This file indexes everything that
 differs, so a rebase can be reasoned about one entry at a time.
 
-Forked at `f401272`.
+Rebased onto upstream `8cec4f8` on 2026-09-01 (previously based on `c21ec9e`, #174 —
+the earlier "forked at `f401272`" note in this file was already stale by nine commits).
+
+Upstream's **Live Transcription with Parakeet v3** (`684ae8e`, #184) landed in that
+range and is the only upstream change that touches this fork's work. See
+[Relationship to upstream streaming](#relationship-to-upstream-streaming) below.
 
 ---
 
@@ -38,22 +43,50 @@ Full detail in [`models/whisper/README_KV.md`](models/whisper/README_KV.md).
 
 Two edits, both in support of the Whisper KV bundle. Kept as small as possible.
 
-### `swift/Sources/CoreAIShared/Runtime/NDArray+Helpers.swift:63`
+### Beta-SDK compilation fixes
 
-```diff
--    let view = array.mutableView(as: type)
-+    var view = array.mutableView(as: type)
+Upstream `main` does not compile against the macOS 27 beta SDK in this checkout. The
+fixes are spread over a few files and are **not specific to this fork's work** — they
+should go upstream.
+
+Two distinct defects:
+
+**`let` where the SDK now needs `var`.** `mutableView(as:)` returns a view whose
+`withUnsafeMutablePointer` is `mutating`, so every `let view = array.mutableView(...)`
+fails to compile. Sites: `CoreAIShared/Runtime/NDArray+Helpers.swift:63`,
+`CoreAIObjectDetector`, `CoreAIDiffusionPipeline`, `CoreAILanguageModels`,
+`Tools/diffusion-runner`.
+
+**Byte-level access to a bfloat16 array.** `rawView().withUnsafeBytes` and
+`mutableRawView().withUnsafeMutableBytes` no longer exist. The obvious substitution
+does not work either: *every* typed view — `NDArray.view(as:)`,
+`NDArray.mutableView(as:)`, and `RawView`/`MutableRawView`'s own `view(as:)` — asserts
+that the element type matches the array's scalar type, and `BFloat16` is not a public
+type anywhere in the SDK. So a bfloat16 array cannot be viewed as itself from outside
+the runtime; it compiles and then traps at run time. `RawSpan` / `MutableRawSpan` is
+the one door that does not type-check, and is what these sites now use:
+`CoreAIShared/Runtime/NDArray+Helpers.swift` (`flattenBFloat16NDArray`),
+`CoreAIDiffusionPipeline` (`packFloatsIntoNDArray`), and
+`Tests/CoreAISharedTests/NDArrayHelpersTests.swift`.
+
+`CoreAIVisionLanguageModel.swift:32` has separate drift (`LanguageModelCapabilities`
+gained a `capabilities:` argument label), fixed the same way.
+
+**The package now builds and tests in full**, which the previous note said it could
+not. Two test bundles still fail to *load* on this machine — `LanguageModelsTests` and
+`GuidedGenerationTests` — because the installed `FoundationModels.framework` predates
+the `capabilities:` signature the SDK compiles against. That is an OS/SDK mismatch,
+not a fork problem, and it blocks a plain `swift test`; run the bundles directly to
+work around it:
+
+```sh
+swift build --build-tests
+xcrun xctest .build/out/Products/Debug/SpeechTests.xctest
 ```
 
-Upstream `main` does not compile against the macOS 27 beta SDK in this checkout —
-`fillNDArray` calls a mutating member on a `let` binding. Nothing in the package
-builds without this. **Not specific to this fork's work**; it should go upstream.
-
-The same defect exists in `CoreAIObjectDetector`, `CoreAIDiffusionPipeline`,
-`CoreAILanguageModels`, and `Tools/diffusion-runner`, and `CoreAILanguageModels/VLM/
-CoreAIVisionLanguageModel.swift:32` has separate SDK drift (`missing argument label
-'capabilities:'`). Those are left alone — they do not affect `speech-recognizer`, but
-they do mean **`swift test` cannot build the full package** in this checkout.
+408 tests pass across `SpeechTests` (163), `CoreAISharedTests` (53),
+`DiffusionPipelineTests` (67), `ObjectDetectorTests` (22), `ImageSegmenterTests` (60)
+and `CoreAILMCommonTests` (43).
 
 ### Long-form audio: overlapping windows
 
@@ -72,10 +105,18 @@ transcripts with the duplicated words at each seam removed. `DecodeStats.windowC
 reports the split and the CLI prints it. `--window-overlap` tunes it; `0` restores
 butted windows with no de-duplication.
 
-Measured on a 62.3 s clip: 3 windows, 200 steps, 3.1 s wall clock. Without the
-overlap the 30 s seam lands mid-sentence and six words are lost outright
+Re-measured after the `8cec4f8` rebase, on the same 62.3 s clip
+(`whisper-large-v3-turbo-kv_float16`, release build, Apple silicon Mac):
+**3 windows, 209 steps, 5.0 ms/step, 1559 ms end to end** (1036 ms of it decode, 66%).
+Without the overlap the 30 s seam lands mid-sentence and six words are lost outright
 ("My biological mother was a young,"); with it they are recovered and no duplicate
-4-gram appears anywhere in the output.
+4-gram appears anywhere in the output — still true on the rebased tree.
+
+The pre-rebase figures were 200 steps at 6.9 ms/step and 2133 ms. Two things moved:
+the step count is +9 because language detection is now on by default (one extra step,
+and a slightly different transcript), and the per-step time is down because upstream's
+decoder rewrite stopped flattening the logits to `[Float]` on every step. Do not read
+the two as a controlled comparison.
 
 This is the naive long-form strategy, one step up from the pre-fork
 `WhisperASR.swift`, which used fixed non-overlapping windows and documented the
@@ -88,6 +129,24 @@ mode is a repeated word rather than dropped speech.
 
 Windowing keys off `MelConfig.nFrames`, so a dynamic encoder (Parakeet's, unless
 exported at a static length) still takes the whole waveform in one pass.
+
+<a name="relationship-to-upstream-streaming"></a>
+#### Relationship to upstream streaming
+
+Upstream's `684ae8e` added a genuine streaming path — `startStream` / `append(pcm:)` /
+`finishStream`, with a `[left | chunk | right]` window and the transducer state carried
+across hops. **It does not replace this windowing, and the two do not overlap:**
+
+- Streaming is **Parakeet-only** and needs a bundle exported with `--streaming`; it
+  rejects a static or dynamic bundle. This windowing is what makes **Whisper's** fixed
+  30 s encoder usable on long files, and Whisper has no streaming path at all.
+- Streaming carries decoder state across chunk boundaries. This stitches *text* at the
+  seam, because a Whisper window is decoded independently and there is no transducer
+  state to carry.
+
+So both stay. For a long *file* on Parakeet, this windowing is still the batch path;
+upstream streaming is for live audio, and costs more encoder work per second of audio
+(it re-encodes the whole window every hop).
 
 ### Compute-unit selection: decode graphs pinned to CPU
 
@@ -105,28 +164,49 @@ not specialize per shape.
 The encoder is left `.automatic`: it wants the GPU, and the runtime's own fallback
 already lands it there (see the Neural Engine note below).
 
-**Whisper**, 5.5 s clip, per decode step:
+Re-measured after the `8cec4f8` rebase on an 11 s clip (`jfk.wav`), release build,
+Apple silicon Mac. The original 5.5 s clip is not in this tree, so the absolute
+figures are not comparable with the pre-rebase ones below them — **the conclusions
+are unchanged, and that is the point of re-running them.**
 
-| Decoder placement | ms/step |
-| --- | ---: |
-| Default specialization | 1576.2 |
-| **CPU** | **4.9** |
+**Whisper** (`whisper-large-v3-turbo-kv_float16`), per decode step, encoder default:
 
-**Parakeet TDT**, same clip, per decode step (encoder unchanged at ~26 ms):
+| Decoder placement | ms/step | end to end |
+| --- | ---: | ---: |
+| Default specialization | 1482.3 | 40 171 ms |
+| **CPU** | **5.0** | **263 ms** |
+
+A ~296x difference, and unambiguous. (Pre-rebase, on the 5.5 s clip: 1576.2 vs 4.9.)
+
+**Parakeet TDT** (`float32_static`), per decode step, encoder default:
 
 | Decode graphs | ms/step | decode total |
 | --- | ---: | ---: |
-| Default specialization | 0.7 | 52.8 ms |
-| GPU | 0.8 | 55.3 ms |
-| **CPU** | **0.3** | **37.8 ms** |
+| Default specialization | 0.7 | 30.4 ms |
+| GPU | 0.7 | 32.2 ms |
+| **CPU** | **0.4** | **17.7 ms** |
 
-Per-graph medians behind that, from `AIModel.load` directly:
+Still a ~1.7x faster decode loop on CPU. (Pre-rebase the ratio was ~2.4x; the absolute
+totals dropped a lot because upstream's decoder rewrite reads the argmax straight out
+of the `NDArray` instead of flattening the logits row to `[Float]` every step, and
+slices the encoder output per frame instead of flattening it whole up front.)
 
-| graph | automatic | ANE | GPU | CPU |
-| --- | ---: | ---: | ---: | ---: |
-| parakeet encoder (30 s window) | *aborts* | 120.97 | **26.06** | 188.97 |
-| parakeet decoder_step | 0.79 | 0.67 | 0.72 | **0.12** |
-| parakeet joint | *fails to load* | 0.28 | 0.62 | **0.18** |
+**Encoder placement**, decoder pinned to CPU, same 11 s clip, end to end:
+
+| encoder | parakeet f32 static | parakeet f16 static | whisper KV f16 |
+| --- | ---: | ---: | ---: |
+| automatic (the default) | **105.7 ms** | **39.4 ms** | **260.6 ms** |
+| GPU | 106.7 ms | 40.1 ms | 270.5 ms |
+| Neural Engine | 108.9 ms | 127.9 ms | 600.5 ms |
+| CPU | 387.5 ms | — | — |
+
+`.automatic` remains the right default for the encoder on Mac for all three. Note the
+f16 Parakeet export is **2.7x faster end to end than f32** (39.4 vs 105.7 ms) — worth
+knowing, since `CoreAIModel.parakeetTDT06BV3` still resolves to the f32 bundle.
+
+The per-graph medians that used to sit here came from a separate `AIModel.load`
+harness that is not in this tree, so they have **not** been re-measured and have been
+dropped rather than left to rot.
 
 There is precedent for pinning: `SpeechRecognizerMain.swift` already pins the
 monolithic Whisper path to CPU, commented *"the monolithic f16/f32 Whisper export
@@ -166,23 +246,44 @@ speech-recognizer --model <bundle> --audio-path a.wav \
   --compute-encoder gpu --compute-decoder cpu    # automatic | cpu | gpu | neuralEngine
 ```
 
-#### Neural Engine: both encoders hit the same lowering bug
+#### Neural Engine: the lowering bug is gone, and the ANE still loses
 
-Whisper's and Parakeet's encoders both fail to lower to the ANE with the same
-signature — a rank-promoting broadcast the compiler mis-infers:
+This section previously recorded that both encoders failed to lower to the ANE with a
+mis-inferred rank-promoting broadcast (`memref<1x1500x1500x1280xf16>` for Whisper,
+`memref<1x376x376x1024xf16>` for Parakeet), that Parakeet's *aborted the process* in
+Python, and that the Swift runtime only survived it by falling back. The
+`SpeechComputeUnits` doc comment said neither lowers; `CLAUDE.md` in the Circe repo
+recorded a third signature, *"ANE regionCall op not found"*.
+
+**None of that reproduces on the rebased tree.** Re-measured with
+`--compute-encoder neuralEngine` on the 11 s clip:
+
+| bundle | ANE warnings emitted | end to end (ANE) | end to end (automatic) |
+| --- | --- | ---: | ---: |
+| `whisper-large-v3-turbo-kv_float16` | **none** | 600.5 ms | 260.6 ms |
+| `parakeet-tdt-0.6b-v3_float16_static` | **none** | 127.9 ms | 39.4 ms |
+
+Both f16 encoders now lower to the Neural Engine cleanly and run — no abort, no
+fallback, no diagnostics on stderr at all. The ANE is simply **2.3x (Whisper) and
+3.2x (Parakeet) slower than letting the runtime choose**, which lands them on the GPU.
+
+The **f32** exports are a separate matter and not a bug: the ANE has no f32 path, so
+`--compute-encoder neuralEngine` on `parakeet-tdt-0.6b-v3_float32_static` produces a
+wall of
 
 ```
-whisper:  inferred 'memref<1x1500x1500x1280xf16>' vs 'memref<1x1x1500x1280xf16>'
-parakeet: inferred 'memref<1x376x376x1024xf16>'   vs 'memref<1x1x376x1024xf16>'
+Incompatible element type for ANE: expected fp16, f8E4M3, si8, ui8, si16, or ui16
+failed: ANE I/O op can only do F16 MemRef <-> F32 Tensor cast
 ```
 
-For Whisper this is **fixed in the export** (`_BatchedPositions`, see
-`models/whisper/README_KV.md`). For Parakeet it is not, and there is little reason to:
-even lowering cleanly, the ANE encoder is 121 ms against the GPU's 26 ms at fp16. It
-would only become interesting with palettized weights — the pre-fork measurements put
-a 4-bit palettized encoder at ~38 ms on ANE. Note that in Python the failure *aborts
-the process*; the Swift runtime survives it by falling back, which is why the default
-policy still gets a 26 ms encoder.
+and falls back, arriving at the same 108.9 ms as `.automatic`. Pinning the ANE for an
+f32 bundle costs a failed probe and buys nothing.
+
+So the conclusion that put the encoder on `.automatic` still holds — but for a
+different reason than this file used to give. It is not that the ANE cannot be
+reached; it is that reaching it is slower. Palettized weights remain the only thing
+that would make it interesting (the pre-fork measurements put a 4-bit palettized
+encoder at ~38 ms on ANE).
 
 ---
 
@@ -249,6 +350,42 @@ $ … --language bundle
 caller that relied on always decoding as the pinned language must now pass
 `.bundleDefault` explicitly. `transcribeCapturingStages(pcm:)` is untouched and
 still uses the pinned prefix, so the PyTorch parity traces are unaffected.
+
+---
+
+### The merged `transcribe` signature
+
+The `8cec4f8` rebase had to fold this fork's two `transcribe` parameters together with
+upstream's. Keeping them as separate overloads was not an option: every parameter past
+the first has a default, so a bare `transcribe(pcm:)` would have been ambiguous.
+
+```swift
+public func transcribe(
+    pcm: [Float],
+    overlapSeconds: Double = SpeechRecognitionModel.defaultOverlapSeconds,  // this fork
+    language: SpeechLanguage = .detect,                                     // this fork
+    resetAfterSilenceFrames: Int = 0                                        // upstream
+) async throws -> (String, DecodeStats)
+```
+
+`transcribe(audioURL:…)` takes the same three. `resetAfterSilenceFrames` is applied
+**per window** on the long-form path, which is free of consequence: each window is
+decoded independently, so no predictor state crosses a seam in the first place.
+
+Upstream also removed `decodeAudio(from:)` — this fork had already folded it into
+`transcribe(audioURL:)`, so the rebase kept the fork's shape.
+
+Two silent breakages this rebase had to fix, neither of which git flagged as a
+conflict — worth knowing about for the next one:
+
+- `runEncoder` changed arity, from `(NDArray, [Int])` to `(NDArray, [Int], Int)`; the
+  valid-frame count moved inside it. `resolvedResources(forLeadingPCM:language:)`
+  destructured the old pair in a hunk that merged cleanly and then did not compile.
+- `validEncoderFrames` went from an instance method to a `package static` taking
+  `config:` and `subsamplingFactor:`, **and changed meaning**: from a proportional
+  estimate rounded to nearest, to an exact per-stage stride-2 derivation. Whisper is
+  unaffected (`WhisperDecoder` documents that it ignores the value and stops on EOT);
+  Parakeet's last partial window now gets an exact cap instead of a rounded one.
 
 ---
 

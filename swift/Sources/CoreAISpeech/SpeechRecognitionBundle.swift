@@ -63,9 +63,14 @@ public enum SpeechComputeUnit: String, Sendable, CaseIterable {
 /// — a much smaller GPU against a comparable Neural Engine — so re-measure there
 /// rather than assuming these carry over. See `FORK.md` for the numbers and method.
 public struct SpeechComputeUnits: Sendable, Equatable {
-    /// Encoder. `.automatic` in the default policy: neither Whisper's nor Parakeet's
-    /// encoder lowers to the Neural Engine today, and the runtime's own fallback
-    /// already lands them on the GPU, which measured fastest.
+    /// Encoder. `.automatic` in the default policy, because the runtime's own choice
+    /// measured fastest for both architectures.
+    ///
+    /// Not because the Neural Engine is unreachable — an earlier version of this
+    /// comment said neither encoder lowers to it, and that is no longer true. Both f16
+    /// exports lower cleanly and run, they are just slower than what `.automatic`
+    /// picks: 2.3x for Whisper, 3.2x for Parakeet, measured on Mac. An f32 export
+    /// cannot use the ANE at all (no f32 path) and falls back after a failed probe.
     public var encoder: SpeechComputeUnit
     /// Per-token graphs: Whisper's decoder step, Parakeet's `decoder_step` + `joint`.
     public var decoder: SpeechComputeUnit

@@ -36,42 +36,53 @@ uv run export.py --help
 
 ### Static window vs. dynamic encoder
 
-**Use the default (static, 30 s) unless you have a specific reason not to.**
-
 A static export bakes one audio length into the encoder. The runtime pads shorter
 audio up to that window and splits longer audio into overlapping windows, so the
 window length sets how many encoder passes a file costs: at 30 s a one-minute clip
-is two passes, at 5 s it is twelve. That is why the default is 30 s.
+is two passes, at 5 s it is twelve. That is why the default is 30 s rather than
+upstream's 5 s.
 
 `--dynamic` sidesteps the split — the encoder accepts any length and the whole
-waveform goes through in one pass. That sounds like it should be faster, and it
-isn't: a dynamic graph is re-specialized for each new input length it sees, and that
-cost dominates. On a 62.3 s clip, float32, Apple silicon Mac:
+waveform goes through in one pass.
 
-| | encoder | end-to-end | decode steps |
+**This recommendation has flipped.** It used to read "use the default (static, 30 s)
+unless you have a specific reason not to", on the strength of a measurement where the
+dynamic graph's per-length re-specialization dominated: 417 ms static against 820 ms
+dynamic on a 62.3 s clip. Re-measured on the same clip after the `8cec4f8` rebase,
+float32, release build, Apple silicon Mac:
+
+| | end to end | decode steps | decode total |
 | --- | ---: | ---: | ---: |
-| **static, 30 s (default)** | 3 × ~85.6 ms | **417 ms** | 358 |
-| dynamic | 678 ms (one pass) | 820 ms | 324 |
+| static, 30 s (default) | 409–423 ms | 356 | 135–147 ms |
+| **dynamic** | **368–371 ms** | **324** | 120–122 ms |
 
-The static export is ~2x faster end to end despite running the encoder three times,
-because its shape never changes and one specialization is reused for every window —
-and for every subsequent file. The dynamic graph pays that cost again on each new
-length, and the specialization cache does not survive the process.
+Ranges are cold and warm Core AI specialization cache (`--clear-coreai-cache` and
+not); the gap between them is ~3%, so the cache is no longer the deciding factor it
+was. **Dynamic is now ~12% faster end to end**, not 2x slower. The 820 ms dynamic
+figure does not reproduce at all.
 
-Two things the static path gives up:
+What did not change is the reason the static path does more decoding: the 2 s overlap
+between windows is decoded twice, which is exactly the 356-vs-324 step gap — the same
++32 as before.
 
-- **Seams.** Windows overlap by 2 s and the runtime removes the duplicated words
-  where they join, but that is a text-matching heuristic. When the two windows
-  transcribe the shared audio differently no run matches and the text is
-  concatenated rather than guessed at, so a word can repeat at a boundary. The
-  dynamic path has no seams at all.
-- **Re-decoding the overlap.** The 2 s shared between windows is decoded twice —
-  visible above as 358 steps against the dynamic path's 324.
+So the two are close enough on this clip that the choice should be made on behaviour
+rather than speed:
 
-So prefer `--dynamic` when transcript quality at window boundaries matters more than
-latency, or when every input is the same length and the one-off specialization is
-paid once. Otherwise the default wins. Numbers are from one clip on one machine —
+- **Static** keeps one graph shape, so it specializes once and every subsequent file
+  of any length reuses it. Its cost is **seams**: windows overlap by 2 s and the
+  runtime removes the duplicated words where they join, but that is a text-matching
+  heuristic — when the two windows transcribe the shared audio differently no run
+  matches and the text is concatenated, so a word can repeat at a boundary.
+- **Dynamic** has no seams at all and does less decoding, but presents a new shape for
+  every distinct input length.
+
+Prefer `--dynamic` when transcript quality at window boundaries matters, or when
+inputs are long. Prefer static when inputs vary widely in length and you want one
+specialization to serve all of them. Numbers are from one clip on one machine —
 re-measure before relying on them for a different platform, notably iOS.
+
+A third option now exists: `--streaming`, for live audio. It is not a faster way to
+transcribe a file — it re-encodes its whole window every hop — see [Streaming](#streaming).
 
 **Supported models:**
 
