@@ -201,8 +201,8 @@ slices the encoder output per frame instead of flattening it whole up front.)
 | CPU | 387.5 ms | — | — |
 
 `.automatic` remains the right default for the encoder on Mac for all three. Note the
-f16 Parakeet export is **2.7x faster end to end than f32** (39.4 vs 105.7 ms) — worth
-knowing, since `CoreAIModel.parakeetTDT06BV3` still resolves to the f32 bundle.
+f16 Parakeet export is **2.7x faster end to end than f32** (39.4 vs 105.7 ms), which
+is what moved CirceKit's `CoreAIModel.parakeetTDT06BV3` onto the f16 bundle.
 
 The per-graph medians that used to sit here came from a separate `AIModel.load`
 harness that is not in this tree, so they have **not** been re-measured and have been
