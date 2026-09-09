@@ -84,7 +84,7 @@ swift build --build-tests
 xcrun xctest .build/out/Products/Debug/SpeechTests.xctest
 ```
 
-408 tests pass across `SpeechTests` (163), `CoreAISharedTests` (53),
+412 tests pass across `SpeechTests` (167), `CoreAISharedTests` (53),
 `DiffusionPipelineTests` (67), `ObjectDetectorTests` (22), `ImageSegmenterTests` (60)
 and `CoreAILMCommonTests` (43).
 
@@ -147,6 +147,84 @@ across hops. **It does not replace this windowing, and the two do not overlap:**
 So both stay. For a long *file* on Parakeet, this windowing is still the batch path;
 upstream streaming is for live audio, and costs more encoder work per second of audio
 (it re-encodes the whole window every hop).
+
+### Partial transcripts from an offline decode
+
+**Added:** `swift/Sources/CoreAISpeech/SpeechTranscriptionUpdate.swift`,
+`swift/Tests/SpeechTests/PartialTranscriptTests.swift`
+**Changed:** `swift/Sources/CoreAISpeech/ParakeetTDTDecoder.swift`,
+`swift/Sources/CoreAISpeech/SpeechRecognitionModel.swift`
+
+`transcribe(pcm:)` returned nothing until the last window was decoded. For a host
+app that is a progress bar with no transcript behind it, and the information was
+already there — the TDT loop emits symbols and advances frames as it goes, it
+just had nowhere to send them.
+
+`ParakeetTDTDecoder.decode` now takes optional `onToken` / `onProgress`
+callbacks, and both `transcribe` overloads take an `onPartial` that receives
+`SpeechTranscriptionUpdate` values. All three default to `nil`.
+
+**An update is a whole-transcript replacement, never an append-only delta.** The
+transducer revises what it has already emitted, and long-form windows are joined
+by seam matching that deletes duplicated words — so a delta stream would be wrong
+at exactly the two moments it mattered. `update.text` is always the full
+transcript so far, stitched across completed windows; a caller assigns it rather
+than appending. `update.source` says where it came from: `.decoder` mid-window,
+`.window` when one completes.
+
+**Token collection is unthrottled; detokenization is capped at 20 Hz.** Every
+token is kept, but `SpeechTokenReporter` only re-detokenizes and emits when 50 ms
+have passed since its last emission, so a fast decode does not spend its time
+rendering text nobody will see. It is an actor, one per window, holding that
+window's token history plus the already-completed windows' text — which is what
+lets each emission be the whole transcript rather than a fragment. The first
+token is never swallowed by the throttle.
+
+**Progress is a fraction of source audio, not of wall clock or token count.**
+`SpeechDecodeProgress.fraction(completedFrames:)` maps completed encoder frames
+onto samples and clamps at both ends, because neither end is well-behaved on its
+own: TDT advances `frame` by a *predicted duration*, so it moves in jumps and can
+overshoot the window (`decodeFrames` carries the overshoot forward as `timeJump`),
+while a static export's padding tail would otherwise read as decoded audio. The
+ceiling is the window's own end and the floor is the previous window's end, so
+overlap cannot walk the number backwards. The result is monotonic and safe to
+bind straight to a progress view.
+
+The callbacks are threaded into `decodeFrames` rather than into `decode` — the
+one place offline, streaming and `--deferred-decode` all share, for the same
+reason the `resetAfterSilenceFrames` reset lives there: a hook duplicated per
+mode is a hook the modes can drift on. `SpeechRecognitionModel` only wires them
+up on the offline path.
+
+**Nothing changes for a caller that passes no `onPartial`.** `tokenReporter`
+returns `nil` unless the decoder is a `ParakeetTDTDecoder`, and `decodeAudio`
+enters the reporting branch only when there is a reporter or a non-zero
+`resetAfterSilenceFrames`, so a Whisper bundle and an unhooked Parakeet run take
+exactly the path they took before and pay nothing — the parity traces are
+unaffected. Whisper bundles do still get `.window` updates when they ask for
+them, since only a transducer can report mid-window.
+
+`speech-recognizer` does not surface these; it prints one transcript at the end.
+The consumer is a host app — CirceKit passes `onPartial` through to
+`CirceTranscriber.Result.partialSource` / `.progress`.
+
+#### This is not upstream streaming
+
+It is the batch path narrating itself, and it shares nothing with
+[`startStream` / `append(pcm:)` / `finishStream`](#relationship-to-upstream-streaming)
+but the decoder underneath:
+
+- It needs **no `--streaming` bundle and no window geometry**. Any Parakeet export
+  works, because the audio is all present before decoding starts.
+- It **re-encodes nothing**. Streaming's cost is one encoder pass over the whole
+  window per hop; this costs one extra detokenization per 50 ms and no inference
+  at all.
+- It makes **no latency claim**. The audio is already on disk, so there is no
+  theoretical latency to quote — only the wait until decoding reaches a given
+  point, which is what the progress fraction reports.
+
+Streaming remains unadopted and is still the thing to reach for when audio
+arrives live.
 
 ### Compute-unit selection: decode graphs pinned to CPU
 
