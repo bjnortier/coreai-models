@@ -84,7 +84,7 @@ swift build --build-tests
 xcrun xctest .build/out/Products/Debug/SpeechTests.xctest
 ```
 
-412 tests pass across `SpeechTests` (167), `CoreAISharedTests` (53),
+419 tests pass across `SpeechTests` (174), `CoreAISharedTests` (53),
 `DiffusionPipelineTests` (67), `ObjectDetectorTests` (22), `ImageSegmenterTests` (60)
 and `CoreAILMCommonTests` (43).
 
@@ -431,6 +431,67 @@ still uses the pinned prefix, so the PyTorch parity traces are unaffected.
 
 ---
 
+### Whisper task selection: translate to English
+
+**Changed:** `swift/Sources/CoreAISpeech/SpeechLanguage.swift`,
+`swift/Sources/CoreAISpeech/SpeechRecognitionBundle.swift`,
+`swift/Sources/CoreAISpeech/SpeechRecognitionModel.swift`,
+`swift/Sources/Tools/speech-recognizer/SpeechRecognizerMain.swift`
+**Added:** `swift/Tests/SpeechTests/SpeechTaskTests.swift`
+
+The prefix slot *after* the language names a task. `<|transcribe|>` writes the
+audio down as spoken; `<|translate|>` writes English. Upstream pins whatever the
+export shipped, which is always `<|transcribe|>`.
+
+`transcribe(pcm:overlapSeconds:language:task:…)` now takes a `SpeechTask` —
+`.transcribe` (**the default**) or `.translateToEnglish`. It is the same
+mechanism as the language selection above and composes with it: **slot 1 keeps
+naming the language being *spoken***, because Whisper translates *from* that
+language and has no token for any target but English. So `.detect` still runs its
+one detection step under `--translate`, and the two retargetings commute.
+
+Task tokens are read from the bundle's `added_tokens.json` for the same reason
+language tags are — large-v3 inserted `<|yue|>` immediately ahead of them, so the
+ids moved between generations. A bundle with no `<|translate|>` token throws
+rather than decoding some other control token. Parakeet TDT is a transducer with
+no task slot at all, and throws rather than handing back a transcript that is
+fluent, plausible and untranslated.
+
+```
+$ speech-recognizer --model exports/whisper-large-v3-turbo-kv_float16 \
+    --audio-path de.wav --translate
+  language: de (detected)
+  task: translate to English
+```
+
+`--translate` is rejected with `--stream`, which is the Parakeet path.
+
+#### The turbo export cannot translate, and says nothing about it
+
+**This is the important part.** `whisper-large-v3-turbo` — the only Whisper bundle
+in `exports/`, and the one `CoreAIModel.whisperLargeV3Turbo` resolves to — was
+distilled on transcription data only. Fed `<|translate|>` it does not fail, warn,
+or produce English: it returns the **same German transcript, token for token**, as
+the run without the flag.
+
+Verified against whisper.cpp v1.9.3 on one FLEURS `de_de` clip, so the finding is
+the model's and not this runtime's:
+
+| model | task | output |
+|---|---|---|
+| turbo (this runtime) | transcribe | *Für die besten Aussichten auf Hongkong…* |
+| turbo (this runtime) | translate | *Für die besten Aussichten auf Hongkong…* — identical |
+| turbo (`whisper-cli -tr`) | translate | identical German |
+| tiny (`whisper-cli -tr`) | translate | *For the best of the success…* — English |
+
+The prefix is confirmed correct at the point of decode
+(`[50258, 50261 <|de|>, 50359 <|translate|>, 50364]`), so the plumbing works and a
+non-turbo Whisper export will translate. **Do not benchmark translation on the
+turbo bundle** — it scores like a broken translator when it is really a model
+that was never given the task.
+
+---
+
 ### The merged `transcribe` signature
 
 The `8cec4f8` rebase had to fold this fork's two `transcribe` parameters together with
@@ -442,11 +503,12 @@ public func transcribe(
     pcm: [Float],
     overlapSeconds: Double = SpeechRecognitionModel.defaultOverlapSeconds,  // this fork
     language: SpeechLanguage = .detect,                                     // this fork
+    task: SpeechTask = .transcribe,                                         // this fork
     resetAfterSilenceFrames: Int = 0                                        // upstream
 ) async throws -> (String, DecodeStats)
 ```
 
-`transcribe(audioURL:…)` takes the same three. `resetAfterSilenceFrames` is applied
+`transcribe(audioURL:…)` takes the same four. `resetAfterSilenceFrames` is applied
 **per window** on the long-form path, which is free of consequence: each window is
 decoded independently, so no predictor state crosses a seam in the first place.
 

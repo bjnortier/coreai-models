@@ -87,6 +87,15 @@ struct SpeechRecognizer: AsyncParsableCommand {
     @Option(name: .long, help: "Language to transcribe as: a code such as 'fr', 'auto' to detect it from the audio (the default), or 'bundle' to use whatever the export pinned. A Whisper export pins a language and otherwise transcribes other languages as if they were it.")
     var language: String = "auto"
 
+    @Flag(
+        name: .long,
+        help: """
+            Translate the audio into English instead of writing it down as spoken. \
+            Whisper only, and English-only as a target — --language still names the \
+            spoken language. Parakeet has no task token and rejects this.
+            """)
+    var translate = false
+
     @Option(
         help:
             "Seconds of audio shared between consecutive windows when the file is longer than one encoder window. The repeated words are removed when the transcripts are joined. 0 butts the windows together with no de-duplication."
@@ -166,6 +175,11 @@ struct SpeechRecognizer: AsyncParsableCommand {
                 "--warmup does not apply to --stream: the window is one fixed shape, so the "
                     + "encoder is already compiled at that shape when the model loads.")
         }
+        if stream, translate {
+            throw ValidationError(
+                "--translate names a task in Whisper's decoder prefix. --stream is the Parakeet "
+                    + "path, which has no task token.")
+        }
         if stream, dumpMel != nil {
             throw ValidationError(
                 "--dump-mel does not apply to --stream: there is one mel window per hop, "
@@ -238,7 +252,8 @@ struct SpeechRecognizer: AsyncParsableCommand {
                 resetAfterSilenceFrames: resetAfterSilenceFrames,
                 computeUnits: SpeechComputeUnits(
                     encoder: computeEncoder, decoder: computeDecoder),
-                language: Self.parseLanguage(language))
+                language: Self.parseLanguage(language),
+                task: translate ? .translateToEnglish : .transcribe)
         } else if stream {
             throw ValidationError(
                 "--stream needs a Parakeet TDT bundle directory. A single .aimodel is the "
@@ -252,7 +267,8 @@ struct SpeechRecognizer: AsyncParsableCommand {
                     "--reset-after-silence-frames applies to a transducer's predictor state; a "
                         + "single .aimodel is the legacy Whisper layout, which has none.")
             }
-            try await runLegacy(model: model, audioPath: audioPath, warmup: warmup)
+            try await runLegacy(
+                model: model, audioPath: audioPath, warmup: warmup, translate: translate)
         }
     }
 
@@ -283,7 +299,8 @@ func runBundle(
     windowOverlap: Double = SpeechRecognitionModel.defaultOverlapSeconds,
     resetAfterSilenceFrames: Int? = nil,
     computeUnits: SpeechComputeUnits = .default,
-    language: SpeechLanguage = .detect
+    language: SpeechLanguage = .detect,
+    task: SpeechTask = .transcribe
 ) async throws {
     // The architecture is printed after loading, once the bundle has reported it.
     // Detect an existing cached specialization before loading so we can annotate the load time
@@ -338,7 +355,7 @@ func runBundle(
     if let audioURL { print("Transcribing \(audioURL.lastPathComponent)…") }
     let t0 = ContinuousClock.now
     let (text, stats) = try await model.transcribe(
-        pcm: pcm, overlapSeconds: windowOverlap, language: language,
+        pcm: pcm, overlapSeconds: windowOverlap, language: language, task: task,
         resetAfterSilenceFrames: resetAfterSilenceFrames ?? 0)
     let totalTranscribeTime = (ContinuousClock.now - t0)
     let totalMs = totalTranscribeTime.inMilliseconds
@@ -366,6 +383,9 @@ func runBundle(
         case .bundleDefault: how = "pinned by the bundle"
         }
         print("  language: \(resolved) (\(how))")
+        if task == .translateToEnglish {
+            print("  task: translate to English")
+        }
     }
     // Report the end-to-end figure separately from the decoder-step statistics
     // above. Printing the wall clock inside the "Decode" section read as though
@@ -388,7 +408,9 @@ func runBundle(
 
 // MARK: - Legacy monolithic model
 
-func runLegacy(model: String, audioPath: String?, warmup: Bool) async throws {
+func runLegacy(
+    model: String, audioPath: String?, warmup: Bool, translate: Bool = false
+) async throws {
     print("Format: legacy (monolithic, no KV cache)")
 
     let modelURL = URL(fileURLWithPath: model)
@@ -446,7 +468,11 @@ func runLegacy(model: String, audioPath: String?, warmup: Bool) async throws {
             states: InferenceFunction.MutableViews(), outputViews: consume out)
     }
 
-    let config = GenerationConfig.whisper
+    // No token table ships with the monolithic export, so the task token is the
+    // large-v3 constant rather than something read from the bundle.
+    let config = translate
+        ? GenerationConfig.whisper.retargeted(toTaskToken: GenerationConfig.whisperTranslateToken)
+        : GenerationConfig.whisper
     var tokens: [Int32] = config.forcedPrefix
     var stepTimesMs: [Double] = []
 

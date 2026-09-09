@@ -96,6 +96,9 @@ public struct SpeechRecognitionBundle: Sendable {
     /// detecting a decode language. Empty for bundles that ship no token table
     /// (Parakeet, which needs none).
     let languageTokens: WhisperLanguageTokens
+    /// The `<|transcribe|>` / `<|translate|>` task tokens this bundle understands.
+    /// Empty for bundles that ship no token table (Parakeet, which has no task slot).
+    let taskTokens: WhisperTaskTokens
     public let tokenizer: (any Tokenizer)?
 
     public enum Kind: Sendable {
@@ -134,6 +137,7 @@ public struct SpeechRecognitionBundle: Sendable {
         if FileManager.default.fileExists(atPath: metadataURL.path) {
             let bundle = try ModelBundle(at: url)
             self.languageTokens = WhisperLanguageTokens(bundleURL: url)
+            self.taskTokens = WhisperTaskTokens(bundleURL: url)
             switch bundle.kind {
             case .speechRecognizer:
                 switch Self.architecture(from: bundle.raw) {
@@ -157,6 +161,7 @@ public struct SpeechRecognitionBundle: Sendable {
         }
         // Legacy Whisper bundle (no metadata.json).
         self.languageTokens = WhisperLanguageTokens(bundleURL: url)
+        self.taskTokens = WhisperTaskTokens(bundleURL: url)
         let assets = try await Self.loadWhisper(bundleURL: url, computeUnits: computeUnits)
         self.kind = .whisper(assets)
         self.tokenizer = try? await Self.loadWhisperTokenizer(
@@ -350,12 +355,24 @@ public struct GenerationConfig: Sendable {
     )
 
     /// The Whisper decoder prefix is `[<|startoftranscript|>, <|lang|>, <|task|>, …]`,
-    /// so the language occupies slot 1.
+    /// so the language occupies slot 1 and the task slot 2.
     static let languagePrefixIndex = 1
+    static let taskPrefixIndex = 2
+
+    /// Whisper large-v3's task tokens, for the legacy monolithic export, which
+    /// ships no token table to read them from. Bundles use their own — see
+    /// ``WhisperTaskTokens``.
+    public static let whisperTranscribeToken: Int32 = 50360
+    public static let whisperTranslateToken: Int32 = 50359
 
     /// The language token this config pins, if its prefix has one.
     public var languageToken: Int32? {
         forcedPrefix.count > Self.languagePrefixIndex ? forcedPrefix[Self.languagePrefixIndex] : nil
+    }
+
+    /// The task token this config pins, if its prefix has one.
+    public var taskToken: Int32? {
+        forcedPrefix.count > Self.taskPrefixIndex ? forcedPrefix[Self.taskPrefixIndex] : nil
     }
 
     /// A copy of this config that decodes as the language `token` names.
@@ -366,6 +383,23 @@ public struct GenerationConfig: Sendable {
         guard forcedPrefix.count > Self.languagePrefixIndex else { return self }
         var prefix = forcedPrefix
         prefix[Self.languagePrefixIndex] = token
+        return GenerationConfig(
+            forcedPrefix: prefix,
+            eotToken: eotToken,
+            maxDecodeSteps: maxDecodeSteps,
+            tokenizerName: tokenizerName
+        )
+    }
+
+    /// A copy of this config whose decode performs the task `token` names.
+    ///
+    /// Only the task slot changes, so the language the caller (or the export)
+    /// selected still names the *spoken* language — which is what
+    /// `<|translate|>` needs, since it translates from that language into English.
+    public func retargeted(toTaskToken token: Int32) -> GenerationConfig {
+        guard forcedPrefix.count > Self.taskPrefixIndex else { return self }
+        var prefix = forcedPrefix
+        prefix[Self.taskPrefixIndex] = token
         return GenerationConfig(
             forcedPrefix: prefix,
             eotToken: eotToken,

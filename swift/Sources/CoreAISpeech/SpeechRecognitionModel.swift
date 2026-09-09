@@ -141,20 +141,21 @@ public actor SpeechRecognitionModel {
     ///
     /// Audio longer than a static encoder's window is decoded as several
     /// overlapping windows and stitched — see
-    /// ``transcribe(pcm:overlapSeconds:resetAfterSilenceFrames:)``.
+    /// ``transcribe(pcm:overlapSeconds:language:task:resetAfterSilenceFrames:)``.
     /// - Parameter resetAfterSilenceFrames: See `ParakeetTDTDecoder.decode`. 0 keeps this path
     ///   reference-exact.
     public func transcribe(
         audioURL: URL,
         overlapSeconds: Double = SpeechRecognitionModel.defaultOverlapSeconds,
         language: SpeechLanguage = .detect,
+        task: SpeechTask = .transcribe,
         resetAfterSilenceFrames: Int = 0,
         onPartial: (@Sendable (SpeechTranscriptionUpdate) -> Void)? = nil
     ) async throws -> (String, DecodeStats) {
         let pcm = try MelSpectrogram.loadAndResample(
             audioURL, targetSampleRate: melConfig.sampleRate)
         return try await transcribe(
-            pcm: pcm, overlapSeconds: overlapSeconds, language: language,
+            pcm: pcm, overlapSeconds: overlapSeconds, language: language, task: task,
             resetAfterSilenceFrames: resetAfterSilenceFrames, onPartial: onPartial)
     }
 
@@ -172,19 +173,25 @@ public actor SpeechRecognitionModel {
     ///   from the audio; pass ``SpeechLanguage/code(_:)`` to force one, or
     ///   ``SpeechLanguage/bundleDefault`` to keep whatever the export pinned.
     ///   Ignored by Parakeet, which decodes multilingual audio directly.
+    /// - Parameter task: whether to write the audio down as spoken (the default)
+    ///   or translate it into English. `language` still names the *spoken*
+    ///   language when translating. Parakeet has no task slot and throws rather
+    ///   than transcribing when asked to translate.
     /// - Parameter resetAfterSilenceFrames: See
-    ///   ``transcribe(audioURL:overlapSeconds:language:resetAfterSilenceFrames:)``.
+    ///   ``transcribe(audioURL:overlapSeconds:language:task:resetAfterSilenceFrames:)``.
     ///   Applied per window: the predictor state does not cross a seam anyway,
     ///   since each window is decoded independently.
     public func transcribe(
         pcm: [Float],
         overlapSeconds: Double = SpeechRecognitionModel.defaultOverlapSeconds,
         language: SpeechLanguage = .detect,
+        task: SpeechTask = .transcribe,
         resetAfterSilenceFrames: Int = 0,
         onPartial: (@Sendable (SpeechTranscriptionUpdate) -> Void)? = nil
     ) async throws -> (String, DecodeStats) {
         guard let windowSamples = staticWindowSamples, pcm.count > windowSamples else {
-            let resolved = try await resolvedResources(forLeadingPCM: pcm, language: language)
+            let resolved = try await resolvedResources(
+                forLeadingPCM: pcm, language: language, task: task)
             let reporter = tokenReporter(
                 completedTexts: [], windowIndex: 0, windowCount: 1,
                 startSample: 0, endSample: pcm.count, previousEndSample: 0, totalSamples: pcm.count, emit: onPartial)
@@ -205,7 +212,7 @@ public actor SpeechRecognitionModel {
         // mid-transcript, producing a hybrid transcript from a monolingual file.
         let firstEnd = min(starts[0] + windowSamples, pcm.count)
         let resolved = try await resolvedResources(
-            forLeadingPCM: Array(pcm[starts[0]..<firstEnd]), language: language)
+            forLeadingPCM: Array(pcm[starts[0]..<firstEnd]), language: language, task: task)
 
         var texts: [String] = []
         var stats: [DecodeStats] = []
@@ -234,7 +241,8 @@ public actor SpeechRecognitionModel {
     public func resolveLanguage(
         pcm: [Float], language: SpeechLanguage = .detect
     ) async throws -> String? {
-        let resolved = try await resolvedResources(forLeadingPCM: pcm, language: language)
+        let resolved = try await resolvedResources(
+            forLeadingPCM: pcm, language: language, task: .transcribe)
         guard case .whisper(_, let config) = resolved, let token = config.languageToken else {
             return nil
         }
@@ -246,16 +254,44 @@ public actor SpeechRecognitionModel {
     /// Detection runs the decoder once over `leadingPCM`, so it happens a single
     /// time per transcription rather than per window.
     private func resolvedResources(
-        forLeadingPCM leadingPCM: [Float], language: SpeechLanguage
+        forLeadingPCM leadingPCM: [Float], language: SpeechLanguage, task: SpeechTask
     ) async throws -> DecoderResources {
         guard case .whisper(let decoderModel, let config) = resources else {
-            return resources  // Parakeet decodes multilingual audio directly.
+            // Parakeet decodes multilingual audio directly, and has no task slot to
+            // put `<|translate|>` in. Thrown rather than ignored: a silently
+            // untranslated transcript is fluent, plausible, and in the wrong language.
+            guard task == .transcribe else {
+                throw SpeechError.incompatibleResources(
+                    "\(architecture) cannot translate: the task is named in Whisper's decoder "
+                        + "prefix, and this architecture has none.")
+            }
+            return resources
         }
+        var resolved = try await languageResolved(
+            config: config, leadingPCM: leadingPCM, language: language)
+        if task == .translateToEnglish {
+            guard let token = bundle.taskTokens.token(for: task) else {
+                throw SpeechError.incompatibleResources(
+                    "This bundle ships no <|translate|> token, so it cannot translate.")
+            }
+            resolved = resolved.retargeted(toTaskToken: token)
+        }
+        return .whisper(decoder: decoderModel, generationConfig: resolved)
+    }
+
+    /// `config` with its language slot set to whatever `language` asks for.
+    ///
+    /// Split out from ``resolvedResources(forLeadingPCM:language:task:)`` so the two
+    /// prefix slots are retargeted independently: a translation still names the
+    /// *spoken* language in slot 1, so detection has to run for it as well.
+    private func languageResolved(
+        config: GenerationConfig, leadingPCM: [Float], language: SpeechLanguage
+    ) async throws -> GenerationConfig {
         let table = bundle.languageTokens
 
         switch language {
         case .bundleDefault:
-            return resources
+            return config
 
         case .code(let code):
             guard let token = table.token(for: code) else {
@@ -264,15 +300,13 @@ public actor SpeechRecognitionModel {
                         ? "This bundle ships no token table, so a language cannot be selected."
                         : "This bundle has no token for language '\(code)'.")
             }
-            return .whisper(
-                decoder: decoderModel,
-                generationConfig: config.retargeted(toLanguageToken: token))
+            return config.retargeted(toLanguageToken: token)
 
         case .detect:
             // With no token table there is nothing to choose between; fall back to
             // the bundle's pin rather than failing the transcription.
             guard !table.isEmpty, let whisper = decoder as? WhisperDecoder else {
-                return resources
+                return config
             }
             let (encOut, encShape, _) = try await runEncoder(pcm: leadingPCM)
             guard let detected = try await whisper.detectLanguageToken(
@@ -280,10 +314,8 @@ public actor SpeechRecognitionModel {
                 encoderOutputShape: encShape,
                 resources: resources,
                 candidates: Set(table.codeByID.keys))
-            else { return resources }
-            return .whisper(
-                decoder: decoderModel,
-                generationConfig: config.retargeted(toLanguageToken: detected))
+            else { return config }
+            return config.retargeted(toLanguageToken: detected)
         }
     }
 
