@@ -184,7 +184,9 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             frames: Range<Int>,
             windowStartFrame: Int,
             collectStats: Bool = true,
-            resetAfterSilenceFrames: Int = 0
+            resetAfterSilenceFrames: Int = 0,
+            onToken: (@Sendable (Int32) async throws -> Void)? = nil,
+            onProgress: (@Sendable (Int) async throws -> Void)? = nil
         ) async throws -> (tokens: [Int32], stats: DecodeStats) {
             try ParakeetTDTDecoder.validate(
                 encoderOutputShape: encoderOutputShape, logitsSize: logitsSize, config: cfg)
@@ -205,7 +207,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                 frames: frames,
                 windowStartFrame: frames.lowerBound,
                 collectStats: collectStats,
-                resetAfterSilenceFrames: resetAfterSilenceFrames)
+                resetAfterSilenceFrames: resetAfterSilenceFrames, onToken: onToken, onProgress: onProgress)
         }
 
         /// As above, for a caller that already holds the encoder output as floats — e.g.
@@ -216,7 +218,9 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             frames: Range<Int>,
             windowStartFrame: Int,
             collectStats: Bool = true,
-            resetAfterSilenceFrames: Int = 0
+            resetAfterSilenceFrames: Int = 0,
+            onToken: (@Sendable (Int32) async throws -> Void)? = nil,
+            onProgress: (@Sendable (Int) async throws -> Void)? = nil
         ) async throws -> (tokens: [Int32], stats: DecodeStats) {
             try ParakeetTDTDecoder.validate(
                 encoderOutputShape: encoderOutputShape, logitsSize: logitsSize, config: cfg)
@@ -313,6 +317,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
 
                     if !isBlank {
                         emitted.append(symbol)
+                        try await onToken?(symbol)
                     }
                     // Carries blanks too, matching HF. Holding the last non-blank instead would
                     // re-feed it and advance the state as if the label repeated.
@@ -367,6 +372,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
                     stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
                 }
                 frame += advance
+                try await onProgress?(min(frame, frames.upperBound) - frames.lowerBound)
             }
 
             // Carry the overshoot rather than clamping it. See `timeJump`.
@@ -438,7 +444,9 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
         encoderOutputShape: [Int],
         validEncoderFrames: Int,
         resources: DecoderResources,
-        resetAfterSilenceFrames: Int
+        resetAfterSilenceFrames: Int,
+        onToken: (@Sendable (Int32) async throws -> Void)? = nil,
+        onProgress: (@Sendable (Int) async throws -> Void)? = nil
     ) async throws -> (tokens: [Int32], stats: DecodeStats) {
         // Only the config is read from `resources`; the two graphs come from the same
         // models this decoder was initialized with, already loaded in `init`.
@@ -465,7 +473,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             encoderOutputShape: encoderOutputShape,
             frames: 0..<cap,
             windowStartFrame: 0,
-            resetAfterSilenceFrames: resetAfterSilenceFrames)
+            resetAfterSilenceFrames: resetAfterSilenceFrames, onToken: onToken, onProgress: onProgress)
     }
 
     /// Preconditions the decode loop's arithmetic depends on.

@@ -148,13 +148,14 @@ public actor SpeechRecognitionModel {
         audioURL: URL,
         overlapSeconds: Double = SpeechRecognitionModel.defaultOverlapSeconds,
         language: SpeechLanguage = .detect,
-        resetAfterSilenceFrames: Int = 0
+        resetAfterSilenceFrames: Int = 0,
+        onPartial: (@Sendable (SpeechTranscriptionUpdate) -> Void)? = nil
     ) async throws -> (String, DecodeStats) {
         let pcm = try MelSpectrogram.loadAndResample(
             audioURL, targetSampleRate: melConfig.sampleRate)
         return try await transcribe(
             pcm: pcm, overlapSeconds: overlapSeconds, language: language,
-            resetAfterSilenceFrames: resetAfterSilenceFrames)
+            resetAfterSilenceFrames: resetAfterSilenceFrames, onPartial: onPartial)
     }
 
     /// Transcribe raw 16 kHz mono PCM samples, returning the full text and decode stats.
@@ -179,14 +180,20 @@ public actor SpeechRecognitionModel {
         pcm: [Float],
         overlapSeconds: Double = SpeechRecognitionModel.defaultOverlapSeconds,
         language: SpeechLanguage = .detect,
-        resetAfterSilenceFrames: Int = 0
+        resetAfterSilenceFrames: Int = 0,
+        onPartial: (@Sendable (SpeechTranscriptionUpdate) -> Void)? = nil
     ) async throws -> (String, DecodeStats) {
         guard let windowSamples = staticWindowSamples, pcm.count > windowSamples else {
             let resolved = try await resolvedResources(forLeadingPCM: pcm, language: language)
+            let reporter = tokenReporter(
+                completedTexts: [], windowIndex: 0, windowCount: 1,
+                startSample: 0, endSample: pcm.count, previousEndSample: 0, totalSamples: pcm.count, emit: onPartial)
             let (tokens, stats) = try await decodeAudio(
                 pcm: pcm, resources: resolved,
-                resetAfterSilenceFrames: resetAfterSilenceFrames)
-            return try (detokenize(tokens), stats)
+                resetAfterSilenceFrames: resetAfterSilenceFrames, reporter: reporter)
+            let text = try detokenize(tokens)
+            onPartial?(SpeechTranscriptionUpdate(text: text, source: .window, windowIndex: 0, windowCount: 1, progress: 1))
+            return (text, stats)
         }
         let overlapSamples = Int(max(0, overlapSeconds) * melConfig.sampleRate)
         let starts = LongForm.windowStarts(
@@ -202,13 +209,21 @@ public actor SpeechRecognitionModel {
 
         var texts: [String] = []
         var stats: [DecodeStats] = []
-        for start in starts {
+        for (index, start) in starts.enumerated() {
             let end = min(start + windowSamples, pcm.count)
+            let previousEnd = index == 0 ? 0 : min(starts[index - 1] + windowSamples, pcm.count)
+            let reporter = tokenReporter(
+                completedTexts: texts, windowIndex: index, windowCount: starts.count,
+                startSample: start, endSample: end, previousEndSample: previousEnd,
+                totalSamples: pcm.count, emit: onPartial)
             let (tokens, windowStats) = try await decodeAudio(
                 pcm: Array(pcm[start..<end]), resources: resolved,
-                resetAfterSilenceFrames: resetAfterSilenceFrames)
+                resetAfterSilenceFrames: resetAfterSilenceFrames, reporter: reporter)
             texts.append(try detokenize(tokens))
             stats.append(windowStats)
+            onPartial?(SpeechTranscriptionUpdate(
+                text: LongForm.stitch(texts), source: .window, windowIndex: index, windowCount: starts.count,
+                progress: Double(end) / Double(pcm.count)))
         }
         return (LongForm.stitch(texts), DecodeStats.merged(stats))
     }
@@ -404,29 +419,55 @@ public actor SpeechRecognitionModel {
         }
     }
 
+    private func tokenReporter(
+        completedTexts: [String], windowIndex: Int, windowCount: Int,
+        startSample: Int, endSample: Int, previousEndSample: Int, totalSamples: Int,
+        emit: (@Sendable (SpeechTranscriptionUpdate) -> Void)?
+    ) -> SpeechTokenReporter? {
+        guard let emit, decoder is ParakeetTDTDecoder else { return nil }
+        return SpeechTokenReporter(
+            completedTexts: completedTexts, windowIndex: windowIndex, windowCount: windowCount,
+            audioProgress: SpeechDecodeProgress(
+                startSample: startSample, endSample: endSample, previousEndSample: previousEndSample,
+                totalSamples: totalSamples,
+                samplesPerFrame: melConfig.hopLength * (tdtConfig?.encoderSubsamplingFactor ?? 1)),
+            detokenize: { tokens in try await self.detokenize(tokens) }, emit: emit)
+    }
+
     /// Decodes exactly one encoder window. Long-form splitting happens in
     /// ``transcribe(pcm:overlapSeconds:language:resetAfterSilenceFrames:)``, which needs detokenized text
     /// to match the seams and so cannot stitch at this level.
     private func decodeAudio(
-        pcm: [Float], resources: DecoderResources? = nil, resetAfterSilenceFrames: Int = 0
+        pcm: [Float], resources: DecoderResources? = nil, resetAfterSilenceFrames: Int = 0,
+        reporter: SpeechTokenReporter? = nil
     ) async throws -> ([Int32], DecodeStats) {
         let (encOut, encShape, validEnc) = try await runEncoder(pcm: pcm)
         let effectiveResources = resources ?? self.resources
         // Not on `SpeechDecoder`, so reached by downcast the way `startStream` does. Thrown
         // rather than ignored elsewhere: silently dropping a flag the caller passed is how a
         // missed effect reads as a clean run.
-        if resetAfterSilenceFrames > 0 {
+        if resetAfterSilenceFrames > 0 || (reporter != nil && decoder is ParakeetTDTDecoder) {
             guard let parakeet = decoder as? ParakeetTDTDecoder else {
                 throw SpeechError.incompatibleResources(
                     "resetAfterSilenceFrames applies to a transducer's predictor state; "
                         + "\(architecture) has none")
+            }
+            let onToken: (@Sendable (Int32) async throws -> Void)?
+            let onProgress: (@Sendable (Int) async throws -> Void)?
+            if let reporter {
+                onToken = { token in try await reporter.append(token) }
+                onProgress = { frames in try await reporter.advance(frames: frames) }
+            } else {
+                onToken = nil
+                onProgress = nil
             }
             return try await parakeet.decode(
                 encoderOutput: encOut,
                 encoderOutputShape: encShape,
                 validEncoderFrames: validEnc,
                 resources: effectiveResources,
-                resetAfterSilenceFrames: resetAfterSilenceFrames)
+                resetAfterSilenceFrames: resetAfterSilenceFrames,
+                onToken: onToken, onProgress: onProgress)
         }
         return try await decoder.decode(
             encoderOutput: encOut,
