@@ -267,6 +267,21 @@ def _write_generation_config(bundle_dir: Path, model_name: str, cfg) -> None:
     )
 
 
+def _write_added_tokens(bundle_dir: Path) -> None:
+    """Write the special-token table CoreAISpeech reads language and task ids from.
+
+    transformers 5 saves only tokenizer.json and tokenizer_config.json, so the
+    table is taken from tokenizer.json's `added_tokens` rather than relying on
+    `save_pretrained` to emit added_tokens.json.
+    """
+    tokenizer = json.loads((bundle_dir / "tokenizer.json").read_text())
+    table = {token["content"]: token["id"] for token in tokenizer["added_tokens"]}
+    for required in ("<|translate|>", "<|transcribe|>", "<|en|>"):
+        if required not in table:
+            raise ValueError(f"tokenizer.json has no {required} token")
+    (bundle_dir / "added_tokens.json").write_text(json.dumps(table, indent=2) + "\n")
+
+
 def create_whisper_kv(
     output_dir: str,
     model_name: str,
@@ -360,6 +375,7 @@ def create_whisper_kv(
     # swift-transformers needs tokenizer.json *and* tokenizer_config.json in the
     # bundle root; if the local load fails it does not fall back to the HF cache.
     processor.tokenizer.save_pretrained(str(bundle_dir))
+    _write_added_tokens(bundle_dir)
     print(f"[INFO] Wrote KV-cache bundle to {bundle_dir}")
     return bundle_dir
 

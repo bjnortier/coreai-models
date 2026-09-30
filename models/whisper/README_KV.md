@@ -74,8 +74,13 @@ whisper-large-v3-turbo-kv_float16/
 ├── encoder.aimodel         filename is hardcoded in SpeechRecognitionBundle;
 ├── decoder.aimodel         the `assets` map is ignored on the Whisper path
 ├── generation_config.json  forced prefix, eos, max_new_tokens, tokenizer_name
-└── tokenizer.json + tokenizer_config.json + vocab.json + merges.txt + …
+├── added_tokens.json       `<|…|>` special tokens → ids, from tokenizer.json
+└── tokenizer.json + tokenizer_config.json (+ vocab.json + merges.txt + … on transformers 4)
 ```
+
+`added_tokens.json` is written by the exporter itself: it is where CoreAISpeech reads
+the language and `<|translate|>` ids, and transformers 5's `save_pretrained` no longer
+emits it.
 
 `metadata.json` is required in practice: without it the CLI routes the directory to
 its legacy single-asset path and fails. The tokenizer files must be shipped as a set
