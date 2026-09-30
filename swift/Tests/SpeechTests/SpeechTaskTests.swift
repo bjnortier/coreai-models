@@ -87,6 +87,31 @@ struct SpeechTaskTests {
         #expect(tokens.token(for: .translateToEnglish) == 50359)
     }
 
+    /// Some exports (whisper-large-v3-kv_float16) ship neither `added_tokens.json`
+    /// nor `vocab.json`; their special tokens live only in `tokenizer.json`.
+    @Test("Task and language tokens fall back to tokenizer.json")
+    func parsesTokenizerJSON() throws {
+        let dir = FileManager.default.temporaryDirectory
+            .appending(path: "speech-task-\(UUID().uuidString)", directoryHint: .isDirectory)
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: dir) }
+        let added: [[String: Any]] = [
+            ["id": 50258, "content": "<|startoftranscript|>", "special": true],
+            ["id": 50259, "content": "<|en|>", "special": true],
+            ["id": 50265, "content": "<|fr|>", "special": true],
+            ["id": 50359, "content": "<|translate|>", "special": true],
+            ["id": 50360, "content": "<|transcribe|>", "special": true],
+        ]
+        let tokenizer: [String: Any] = ["version": "1.0", "added_tokens": added, "model": ["type": "BPE"]]
+        try JSONSerialization.data(withJSONObject: tokenizer).write(to: dir.appending(path: "tokenizer.json"))
+
+        let tokens = WhisperTaskTokens(bundleURL: dir)
+        #expect(tokens.token(for: .transcribe) == 50360)
+        #expect(tokens.token(for: .translateToEnglish) == 50359)
+        let languages = WhisperLanguageTokens(bundleURL: dir)
+        #expect(languages.token(for: "fr") == 50265)
+    }
+
     /// The numbering is generation-specific — large-v3 inserted `<|yue|>` ahead of
     /// the task tokens — which is why they are read rather than hardcoded.
     @Test("A bundle numbered differently is read, not assumed")

@@ -112,17 +112,36 @@ struct WhisperTaskTokens: Sendable {
     }
 }
 
-/// A bundle's `<|…|>` special tokens, from `added_tokens.json` (falling back to
-/// `vocab.json`).
+/// A bundle's `<|…|>` special tokens, from `added_tokens.json`, falling back to
+/// `vocab.json` and then to the `added_tokens` array in `tokenizer.json`.
 ///
 /// Shared by the language and task tables so a bundle is parsed the same way for
-/// both — and so the fallback order is stated once.
+/// both — and so the fallback order is stated once. Some exports ship only
+/// `tokenizer.json`; without the last fallback they would silently decode with
+/// their pinned language and could not translate.
 func whisperSpecialTokens(bundleURL: URL) -> [String: Int32] {
-    for name in ["added_tokens.json", "vocab.json"] {
+    for name in ["added_tokens.json", "vocab.json", "tokenizer.json"] {
         let url = bundleURL.appending(path: name)
         guard let data = try? Data(contentsOf: url),
-            let table = try? JSONSerialization.jsonObject(with: data) as? [String: Int]
+            let json = try? JSONSerialization.jsonObject(with: data)
         else { continue }
+
+        let table: [String: Int]
+        if let flat = json as? [String: Int] {
+            table = flat
+        } else if let tokenizer = json as? [String: Any],
+            let added = tokenizer["added_tokens"] as? [[String: Any]]
+        {
+            table = Dictionary(
+                added.compactMap { entry in
+                    (entry["content"] as? String).flatMap { content in
+                        (entry["id"] as? Int).map { (content, $0) }
+                    }
+                },
+                uniquingKeysWith: { first, _ in first })
+        } else {
+            continue
+        }
 
         var specials: [String: Int32] = [:]
         for (token, id) in table where token.hasPrefix("<|") && token.hasSuffix("|>") {
