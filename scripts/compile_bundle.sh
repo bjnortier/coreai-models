@@ -13,10 +13,12 @@
 # Environment:
 #   PLATFORMS               space-separated platforms (default: "iOS macOS")
 #   MIN_DEPLOYMENT_VERSION  passed to coreai-build (default: 27.0)
+#   PREFERRED_COMPUTE       passed to coreai-build: gpu, neural-engine or none
+#                           (default: gpu)
 #
 # Output layout:
-#   OUTPUT_DIR/compiled.iOS/<model>.<arch>.aimodelc     raw compiler output
-#   OUTPUT_DIR/compiled.macOS/<model>.<arch>.aimodelc
+#   OUTPUT_DIR/compiled.iOS/<model>.<arch>.aimodelc     raw compiler output,
+#   OUTPUT_DIR/compiled.macOS/<model>.<arch>.aimodelc   deleted once zipped
 #   OUTPUT_DIR/<bundle>.<platform>.<arch>/               client bundle
 #       metadata.json, processor/, ...                   copied from BUNDLE_DIR
 #       <model>.aimodelc                                 compiled for <arch>
@@ -33,6 +35,7 @@ BUNDLE_NAME="$(basename "$BUNDLE_DIR")"
 OUTPUT_DIR="${2:-${BUNDLE_DIR}_compiled}"
 PLATFORMS="${PLATFORMS:-iOS macOS}"
 MIN_DEPLOYMENT_VERSION="${MIN_DEPLOYMENT_VERSION:-27.0}"
+PREFERRED_COMPUTE="${PREFERRED_COMPUTE:-gpu}"
 
 if [[ ! -f "$BUNDLE_DIR/metadata.json" ]]; then
     echo "error: $BUNDLE_DIR/metadata.json not found" >&2
@@ -59,6 +62,7 @@ for platform in $PLATFORMS; do
         xcrun coreai-build compile "$model" \
             --platform "$platform" \
             --min-deployment-version "$MIN_DEPLOYMENT_VERSION" \
+            --preferred-compute "$PREFERRED_COMPUTE" \
             --output "$compiled_dir"
     done
 
@@ -84,7 +88,8 @@ for platform in $PLATFORMS; do
                 echo "error: $base was not compiled for $platform/$arch" >&2
                 exit 1
             fi
-            cp -R "$src" "$dest/$base.aimodelc"
+            # Move rather than copy so the raw output doesn't sit on disk twice.
+            mv "$src" "$dest/$base.aimodelc"
         done
 
         # Point the metadata's assets at the compiled models.
@@ -102,8 +107,17 @@ with open(path, "w") as f:
     f.write("\n")
 EOF
 
+        # Zip without AppleDouble (._*) or .DS_Store files, and check for them.
+        find "$dest" \( -name '._*' -o -name '.DS_Store' \) -delete
         (cd "$OUTPUT_DIR" && ditto -c -k --norsrc --noextattr --keepParent "$name" "$name.zip")
+        if zipinfo -1 "$dest.zip" | grep -qE '(^|/)(\._|\.DS_Store$)'; then
+            echo "error: $name.zip contains ._ or .DS_Store entries" >&2
+            exit 1
+        fi
     done
+
+    # Every compiled model has been moved into a zipped bundle.
+    rm -rf "$compiled_dir"
 done
 
 echo
