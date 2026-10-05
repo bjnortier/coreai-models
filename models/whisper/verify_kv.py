@@ -100,6 +100,7 @@ async def decode_coreai(
     max_new: int,
     eos: int,
     cache_fill: float,
+    static: bool = False,
 ) -> tuple[list[int], list[float], np.ndarray]:
     enc_out = (await enc_fn({"input_features": NDArray(features)}))[
         "encoder_hidden_states"
@@ -116,10 +117,11 @@ async def decode_coreai(
     first_logits: np.ndarray | None = None
 
     async def step(token: int, pos: int) -> np.ndarray:
+        positions = [pos] if static else np.arange(pos + 1)
         out = await dec_fn(
             {
                 "input_ids": NDArray(np.array([[token]], dtype=np.int32)),
-                "position_ids": NDArray(np.arange(pos + 1, dtype=np.int32)[None, :]),
+                "position_ids": NDArray(np.array(positions, dtype=np.int32)[None, :]),
                 "encoder_hidden_states": enc_out,
             },
             state=state,
@@ -202,6 +204,8 @@ async def main() -> int:
     prefix = [tok for _, tok in sorted(gen_cfg["forced_decoder_ids"])]
     max_new = args.max_new_tokens or gen_cfg["max_new_tokens"]
     eos = gen_cfg["eos_token_id"]
+    # A `--static-positions` export takes the current position alone, not 0..pos.
+    static = "-kv-static_" in meta["name"]
     model_name = gen_cfg["tokenizer_name"]
 
     processor = transformers.AutoProcessor.from_pretrained(model_name)
@@ -226,7 +230,7 @@ async def main() -> int:
 
     t0 = time.perf_counter()
     tokens, step_times, coreai_logits = await decode_coreai(
-        enc_fn, dec_fn, features, prefix, max_new, eos, cache_fill=0.0
+        enc_fn, dec_fn, features, prefix, max_new, eos, cache_fill=0.0, static=static
     )
     total = time.perf_counter() - t0
     tokenizer = processor.tokenizer
@@ -245,7 +249,7 @@ async def main() -> int:
 
     print("\n=== Uninitialized-cache safety ===")
     nan_tokens, _, _ = await decode_coreai(
-        enc_fn, dec_fn, features, prefix, max_new, eos, cache_fill=np.nan
+        enc_fn, dec_fn, features, prefix, max_new, eos, cache_fill=np.nan, static=static
     )
     nan_match = nan_tokens == tokens
     print(f"  NaN-filled cache produces identical tokens: {nan_match}")

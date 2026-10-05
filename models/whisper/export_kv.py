@@ -54,6 +54,7 @@ from coreai_models._constants import KEY_CACHE_NAME, VALUE_CACHE_NAME
 from coreai_models.export.macos import export_to_coreai
 from coreai_models.primitives.macos.cache import KVCache
 from coreai_models.primitives.macos.sdpa import SDPA
+from coreai_models.primitives._ops import mutable_cache_update_and_fetch
 
 # Whisper's forced decode prefix. Resolved to ids through the model's own
 # tokenizer: large-v3 inserted <|yue|> ahead of the control tokens, so
@@ -213,6 +214,95 @@ class WhisperDecoderStep(torch.nn.Module):
         return self.proj_out(self.layer_norm(h))
 
 
+class WhisperDecoderStepStatic(WhisperDecoderStep):
+    """``WhisperDecoderStep`` with every input shape fixed, for the GPU.
+
+    The dynamic step attends over the populated prefix, whose length is
+    ``position_ids.shape[-1]``, so every token is a new shape and the GPU
+    re-specializes the graph at each step. Here ``position_ids`` is ``[1, 1]``
+    holding the current position, the new K/V is written at that position by
+    value, and self-attention always reads all ``max_target_positions`` slots
+    under a mask. Slots past the position are zeroed with ``where`` before the
+    matmul, since the runtime's cache is uninitialized and NaN survives an
+    additive mask.
+
+    Inputs:
+        input_ids             [1, 1] int32 — previous token
+        position_ids          [1, 1] int32 — that token's position
+        encoder_hidden_states [1, 1500, n_layers*2*d_model] — packed cross K/V
+    """
+
+    def forward(self, input_ids, position_ids, encoder_hidden_states, k_cache, v_cache):
+        d = self.d_model
+        n_heads = k_cache.shape[2]
+        max_tgt = k_cache.shape[3]
+        head_dim = k_cache.shape[4]
+        pos = position_ids.reshape(1)
+
+        h = self.embed_tokens(input_ids)
+        h = h + self.embed_positions.weight.index_select(0, pos).reshape(1, 1, d)
+
+        slots = torch.arange(max_tgt, dtype=torch.int32)
+        valid = (slots <= pos).reshape(1, 1, max_tgt, 1)
+        zero = torch.zeros((), dtype=h.dtype)
+        mask = torch.where(
+            valid.reshape(1, 1, 1, max_tgt), zero, torch.finfo(h.dtype).min
+        ).to(h.dtype)
+        zero_i = torch.zeros(1, dtype=torch.int32)
+
+        def update(cache, i, x):
+            layer = torch.tensor([i], dtype=torch.int32)
+            begin = torch.cat([layer, zero_i, zero_i, pos, zero_i])
+            end = torch.cat(
+                [
+                    layer + 1,
+                    torch.tensor([1, n_heads], dtype=torch.int32),
+                    pos + 1,
+                    torch.tensor([head_dim], dtype=torch.int32),
+                ]
+            )
+            full = mutable_cache_update_and_fetch(
+                x=cache,
+                update=x,
+                begin=begin,
+                end=end,
+                layer_idx=i,
+                seq_dim=-2,
+                seq_len=None,
+            )
+            return torch.where(valid, full, zero)
+
+        for i, layer in enumerate(self.layers):
+            # --- self-attention over every cache slot, masked past `pos` ---
+            residual = h
+            x = layer.self_attn_layer_norm(h)
+            sa = layer.self_attn
+            q = self._heads(sa.q_proj(x), 1)
+            k = update(k_cache, i, self._heads(sa.k_proj(x), 1))
+            v = update(v_cache, i, self._heads(sa.v_proj(x), 1))
+            a = self.self_sdpa(q, k, v, attn_mask=mask)
+            h = residual + sa.out_proj(a.transpose(1, 2).reshape(1, 1, d))
+
+            # --- cross-attention, K/V sliced out of the packed encoder tensor ---
+            residual = h
+            x = layer.encoder_attn_layer_norm(h)
+            ca = layer.encoder_attn
+            q = self._heads(ca.q_proj(x), 1)
+            base = i * 2 * d
+            src = encoder_hidden_states.shape[1]
+            ck = self._heads(encoder_hidden_states.narrow(2, base, d), src)
+            cv = self._heads(encoder_hidden_states.narrow(2, base + d, d), src)
+            a = self.cross_sdpa(q, ck, cv).transpose(1, 2).reshape(1, 1, d)
+            h = residual + ca.out_proj(a)
+
+            # --- feed-forward ---
+            residual = h
+            x = layer.final_layer_norm(h)
+            h = residual + layer.fc2(layer.activation_fn(layer.fc1(x)))
+
+        return self.proj_out(self.layer_norm(h))
+
+
 def _metadata(model_name: str, component: str) -> AIModelAssetMetadata:
     # export/metadata.py has no Whisper entry, so build this inline rather than
     # take its empty-author warning path.
@@ -306,6 +396,7 @@ def create_whisper_kv(
     model_name: str,
     dtype: torch.dtype,
     overwrite: bool,
+    static_positions: bool = False,
 ) -> Path:
     print("[INFO] Sourcing model...")
     hf = transformers.AutoModelForSpeechSeq2Seq.from_pretrained(
@@ -319,7 +410,8 @@ def create_whisper_kv(
     max_tgt = cfg.max_target_positions
     packed = n_layers * 2 * cfg.d_model
 
-    variant = f"{Path(model_name).name}-kv_{str(dtype).split('.')[-1]}"
+    kind = "kv-static" if static_positions else "kv"
+    variant = f"{Path(model_name).name}-{kind}_{str(dtype).split('.')[-1]}"
     bundle_dir = Path(output_dir) / variant
     _prepare_bundle_dir(bundle_dir, overwrite)
 
@@ -351,12 +443,14 @@ def create_whisper_kv(
 
     # --- Decoder step ---
     print("[INFO] Exporting decoder step (stateful self-attention KV cache)...")
-    decoder = WhisperDecoderStep(hf)
+    decoder = (WhisperDecoderStepStatic if static_positions else WhisperDecoderStep)(hf)
     decoder.eval()
     reference_inputs = {
         "input_ids": torch.tensor([[forced_decoder_ids[0]]], dtype=torch.int32),
-        "position_ids": torch.arange(POSITION_TRACE_LEN, dtype=torch.int32).unsqueeze(
-            0
+        "position_ids": (
+            torch.tensor([[POSITION_TRACE_LEN - 1]], dtype=torch.int32)
+            if static_positions
+            else torch.arange(POSITION_TRACE_LEN, dtype=torch.int32).unsqueeze(0)
         ),
         "encoder_hidden_states": torch.zeros(
             1, cfg.max_source_positions, packed, dtype=dtype
@@ -369,7 +463,11 @@ def create_whisper_kv(
     dynamic_shapes = {
         "input_ids": None,
         # min=1: the runtime's first priming call passes a single position.
-        "position_ids": {1: torch.export.Dim("seq_pos", min=1, max=max_tgt)},
+        "position_ids": (
+            None
+            if static_positions
+            else {1: torch.export.Dim("seq_pos", min=1, max=max_tgt)}
+        ),
         "encoder_hidden_states": None,
         # Traced at the full context, so the cache has nowhere to grow.
         "k_cache": None,
@@ -428,6 +526,12 @@ def main():
         help="Torch dtype to use for the model.",
     )
     parser.add_argument(
+        "--static-positions",
+        action="store_true",
+        help="Export a decoder whose inputs all have fixed shapes, so the GPU "
+        "specializes it once (bundle suffix -kv-static).",
+    )
+    parser.add_argument(
         "--overwrite",
         action="store_true",
         help="Overwrite an existing bundle at the output path.",
@@ -436,7 +540,9 @@ def main():
 
     dtype = {"float16": torch.float16, "float32": torch.float32}[args.dtype]
     output_dir = args.output_dir or str(Path(__file__).resolve().parents[2] / "exports")
-    create_whisper_kv(output_dir, args.model, dtype, args.overwrite)
+    create_whisper_kv(
+        output_dir, args.model, dtype, args.overwrite, args.static_positions
+    )
 
 
 if __name__ == "__main__":

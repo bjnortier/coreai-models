@@ -235,11 +235,21 @@ public struct WhisperDecoder: SpeechDecoder {
         var valueCache = NDArray(descriptor: valCacheNDDesc.resolvingDynamicDimensions(vcShape))
         var logitsArray = NDArray(descriptor: logitsNDDesc.resolvingDynamicDimensions([1, 1, vocabSize]))
 
+        // A `--static-positions` export fixes `position_ids` at [1, 1] and takes the current
+        // position alone; the dynamic export takes 0...pos, whose length is the cache length.
+        let staticPositions = posIdsNDDesc.shape.last == 1
+
         func step(_ tok: Int32, pos: Int) async throws {
             var ids = NDArray(descriptor: inputIdsNDDesc.resolvingDynamicDimensions([1, 1]))
-            var posIds = NDArray(descriptor: posIdsNDDesc.resolvingDynamicDimensions([1, pos + 1]))
             fillNDArray(&ids, as: Int32.self, with: [tok])
-            fillNDArray(&posIds, as: Int32.self, count: pos + 1) { Int32($0) }
+            var posIds: NDArray
+            if staticPositions {
+                posIds = NDArray(descriptor: posIdsNDDesc)
+                fillNDArray(&posIds, as: Int32.self, with: [Int32(pos)])
+            } else {
+                posIds = NDArray(descriptor: posIdsNDDesc.resolvingDynamicDimensions([1, pos + 1]))
+                fillNDArray(&posIds, as: Int32.self, count: pos + 1) { Int32($0) }
+            }
             var st = InferenceFunction.MutableViews()
             st.insert(&keyCache, for: "keyCache")
             st.insert(&valueCache, for: "valueCache")

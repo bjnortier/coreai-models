@@ -34,6 +34,7 @@ uv run python models/whisper/export_kv.py --dtype float16 --overwrite
 | `--model` | `openai/whisper-large-v3-turbo`, `openai/whisper-large-v3` or `openai/whisper-medium` | turbo |
 | `--output-dir` | Output directory for the bundle | `<repo-root>/exports/` |
 | `--dtype` | `float16`, `float32` — **no bfloat16** (see Limits) | `float16` |
+| `--static-positions` | Fix every decoder input shape (bundle suffix `-kv-static`); see below | — |
 | `--overwrite` | Replace an existing bundle | — |
 
 ## Verify
@@ -199,6 +200,33 @@ Those defaults were measured on Mac and are overridable per stage —
 `SpeechComputeUnits(encoder:decoder:)`, or `--compute-encoder` / `--compute-decoder`
 on the CLI. Re-measure before trusting them on iOS, where the GPU is much smaller
 relative to the Neural Engine. See [`FORK.md`](../../FORK.md).
+
+## Fixed-shape decoder (`--static-positions`)
+
+An experiment to let the GPU run the decoder, kept for reference. With
+`--static-positions` the decoder takes `position_ids` as `[1, 1]` holding the current
+position, writes the new K/V at that position by value
+(`mutable_cache_update_and_fetch` with `seq_len=None`, the iOS LLM path), and attends
+over all 448 cache slots under a mask. Slots past the position are zeroed with
+`torch.where` before the matmul, which drops `NaN` where an additive mask cannot, so the
+uninitialized-state guarantee holds; `verify_kv.py` passes on GPU (token parity, `NaN`
+cache). `WhisperDecoder` recognises the bundle by its fixed `position_ids` shape and
+sends the position alone, so both kinds of bundle run unchanged.
+
+Every step now has the same shape, so the GPU specializes once: 5.3 ms/step against
+~1200 ms for the dynamic graph. **It is not faster than the CPU**, measured on turbo,
+fp16, encoder on GPU throughout:
+
+| Decoder | Mac (M5 Pro), 11 s clip, decode | iPhone 15 Pro, 66 s clip, transcribe |
+| --- | ---: | ---: |
+| dynamic, CPU | ~140 ms | 11.4–11.6 s |
+| static, GPU | ~138 ms | 15.1–23.3 s |
+| static, CPU | ~150 ms | 11.6–12.9 s |
+
+All three gave identical text on both machines. Hello Transcribe 5 therefore keeps the
+published dynamic bundles with the decoder on CPU on macOS and iOS. Deeper decoders
+(medium 24 layers, large-v3 32) are unmeasured and the likeliest place for the GPU to
+win; the app's `HelloTests/WhisperDecoderBenchmark.swift` repeats the device comparison.
 
 ## Limits
 
