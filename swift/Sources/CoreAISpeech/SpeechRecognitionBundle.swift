@@ -202,9 +202,25 @@ public struct SpeechRecognitionBundle: Sendable {
         let decoder = try await computeUnits.decoder.load(decURL)
         let cfgURL = bundleURL.appending(path: "generation_config.json")
         let generationConfig = (try? GenerationConfig(from: cfgURL)) ?? .whisper
+
+        // The mel bin count differs between Whisper generations (128 for large-v3,
+        // 80 for medium and earlier), so read it from the traced encoder input.
+        var melConfig = MelConfig.whisper
+        if let desc = encoder.functionDescriptor(for: "main"),
+            case .ndArray(let nd) = desc.inputDescriptor(of: "input_features")
+        {
+            melConfig = Self.whisperMelConfig(forEncoderMelDim: nd.shape[1])
+        }
         return WhisperAssets(
             encoder: encoder, decoder: decoder,
-            generationConfig: generationConfig, melConfig: .whisper)
+            generationConfig: generationConfig, melConfig: melConfig)
+    }
+
+    /// The Whisper mel config for an encoder whose `input_features` mel axis is `dim`.
+    ///
+    /// A non-positive `dim` (a dynamic axis) keeps the preset's 128 bins.
+    package static func whisperMelConfig(forEncoderMelDim dim: Int) -> MelConfig {
+        dim > 0 ? MelConfig.whisper.withNMelBins(dim) : .whisper
     }
 
     private static func loadParakeetTDT(

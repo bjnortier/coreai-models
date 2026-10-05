@@ -318,6 +318,18 @@ struct EncoderFrameMappingTests {
         #expect(derived.melScale == preset.melScale)
     }
 
+    @Test("A Whisper encoder's mel axis sets nMelBins and nothing else", arguments: [80, 128])
+    func whisperMelBinsFromEncoder(dim: Int) {
+        let derived = SpeechRecognitionBundle.whisperMelConfig(forEncoderMelDim: dim)
+        let preset = MelConfig.whisper
+        #expect(derived.nMelBins == dim)
+        #expect(derived.nFrames == preset.nFrames)
+        #expect(derived.windowPeriodicity == preset.windowPeriodicity)
+        #expect(derived.normalization == preset.normalization)
+        #expect(derived.layout == preset.layout)
+        #expect(derived.melScale == preset.melScale)
+    }
+
     @Test("A dynamic encoder dimension leaves nFrames nil", arguments: [-1, 0])
     func dynamicEncoderDimLeavesFramesNil(dim: Int) {
         #expect(SpeechRecognitionBundle.melConfig(forEncoderTimeDim: dim).nFrames == nil)

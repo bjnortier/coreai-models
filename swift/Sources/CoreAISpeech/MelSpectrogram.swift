@@ -97,6 +97,9 @@ public struct MelConfig: Sendable {
 
     /// Whisper v3-turbo parameters.
     ///
+    /// 128 mel bins is large-v3's count; medium and earlier take 80. Bundles derive the
+    /// real count from the encoder graph — see `SpeechRecognitionBundle.whisperMelConfig`.
+    ///
     /// Slaney mel scale, not HTK: HF's `WhisperFeatureExtractor` builds its filterbank
     /// with `mel_scale="slaney"`, and reference OpenAI Whisper takes librosa's default
     /// (`htk=False`), which is also Slaney. The two scales place every filter
@@ -124,6 +127,15 @@ public struct MelConfig: Sendable {
     /// `windowPeriodicity`, which then fell back to the initializer default. That happened to match
     /// the preset, so static and dynamic exports agreed by luck rather than by construction.
     package func withNFrames(_ nFrames: Int?) -> MelConfig {
+        MelConfig(
+            sampleRate: sampleRate, nFFT: nFFT, winLength: winLength, hopLength: hopLength,
+            nMelBins: nMelBins, nFrames: nFrames, preemphasis: preemphasis,
+            normalization: normalization, layout: layout,
+            padMode: padMode, melScale: melScale, windowPeriodicity: windowPeriodicity)
+    }
+
+    /// A copy of this config with `nMelBins` replaced. See ``withNFrames(_:)``.
+    package func withNMelBins(_ nMelBins: Int) -> MelConfig {
         MelConfig(
             sampleRate: sampleRate, nFFT: nFFT, winLength: winLength, hopLength: hopLength,
             nMelBins: nMelBins, nFrames: nFrames, preemphasis: preemphasis,

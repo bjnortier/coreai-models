@@ -10,7 +10,8 @@ Unlike ``export.py`` (the plain HuggingFace forward, which recomputes the whole
 encoder for every generated token), this writes the encoder/decoder bundle that
 ``CoreAISpeech``'s ``WhisperDecoder`` already knows how to drive:
 
-* ``encoder.aimodel`` — ``input_features [1,128,3000]`` -> ``encoder_hidden_states``
+* ``encoder.aimodel`` — ``input_features [1,n_mels,3000]`` -> ``encoder_hidden_states``
+  (``n_mels`` is 128 for large-v3/turbo, 80 for medium)
 * ``decoder.aimodel`` — one decoder token per call, with the self-attention KV
   cache carried as Core AI **state** (``keyCache`` / ``valueCache``) and updated
   in place between calls.
@@ -54,9 +55,16 @@ from coreai_models.export.macos import export_to_coreai
 from coreai_models.primitives.macos.cache import KVCache
 from coreai_models.primitives.macos.sdpa import SDPA
 
-# Whisper's forced decode prefix: <|startoftranscript|> <|en|> <|transcribe|>
-# <|notimestamps|>. Mirrors GenerationConfig.whisper on the Swift side.
-FORCED_DECODER_IDS = [50258, 50259, 50360, 50364]
+# Whisper's forced decode prefix. Resolved to ids through the model's own
+# tokenizer: large-v3 inserted <|yue|> ahead of the control tokens, so
+# <|transcribe|>/<|notimestamps|> are 50360/50364 there but 50359/50363 on
+# medium and earlier — a hardcoded list silently decodes as the wrong task.
+FORCED_DECODER_TOKENS = [
+    "<|startoftranscript|>",
+    "<|en|>",
+    "<|transcribe|>",
+    "<|notimestamps|>",
+]
 
 # Generated tokens per 30 s window. HuggingFace's own generation_config carries
 # `max_length`, not `max_new_tokens`, and the Swift parser only reads the
@@ -241,6 +249,7 @@ def _write_bundle_metadata(
         "assets": {"encoder": "encoder.aimodel", "decoder": "decoder.aimodel"},
         "config": {
             "architecture": "whisper",
+            "num_mel_bins": cfg.num_mel_bins,
             "d_model": cfg.d_model,
             "decoder_layers": cfg.decoder_layers,
             "decoder_attention_heads": cfg.decoder_attention_heads,
@@ -255,9 +264,19 @@ def _write_bundle_metadata(
     (bundle_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
 
 
-def _write_generation_config(bundle_dir: Path, model_name: str, cfg) -> None:
+def _forced_decoder_ids(tokenizer) -> list[int]:
+    ids = tokenizer.convert_tokens_to_ids(FORCED_DECODER_TOKENS)
+    for token, token_id in zip(FORCED_DECODER_TOKENS, ids):
+        if token_id is None or token_id == tokenizer.unk_token_id:
+            raise ValueError(f"tokenizer has no {token} token")
+    return ids
+
+
+def _write_generation_config(
+    bundle_dir: Path, model_name: str, cfg, forced_decoder_ids: list[int]
+) -> None:
     config = {
-        "forced_decoder_ids": [[i, tok] for i, tok in enumerate(FORCED_DECODER_IDS)],
+        "forced_decoder_ids": [[i, tok] for i, tok in enumerate(forced_decoder_ids)],
         "eos_token_id": cfg.eos_token_id,
         "max_new_tokens": MAX_NEW_TOKENS,
         "tokenizer_name": model_name,
@@ -305,6 +324,7 @@ def create_whisper_kv(
     _prepare_bundle_dir(bundle_dir, overwrite)
 
     processor = transformers.AutoProcessor.from_pretrained(model_name)
+    forced_decoder_ids = _forced_decoder_ids(processor.tokenizer)
 
     # --- Encoder ---
     print(
@@ -334,7 +354,7 @@ def create_whisper_kv(
     decoder = WhisperDecoderStep(hf)
     decoder.eval()
     reference_inputs = {
-        "input_ids": torch.tensor([[FORCED_DECODER_IDS[0]]], dtype=torch.int32),
+        "input_ids": torch.tensor([[forced_decoder_ids[0]]], dtype=torch.int32),
         "position_ids": torch.arange(POSITION_TRACE_LEN, dtype=torch.int32).unsqueeze(
             0
         ),
@@ -371,7 +391,7 @@ def create_whisper_kv(
 
     # --- Sidecars ---
     _write_bundle_metadata(bundle_dir, variant, cfg, dtype)
-    _write_generation_config(bundle_dir, model_name, cfg)
+    _write_generation_config(bundle_dir, model_name, cfg, forced_decoder_ids)
     # swift-transformers needs tokenizer.json *and* tokenizer_config.json in the
     # bundle root; if the local load fails it does not fall back to the HF cache.
     processor.tokenizer.save_pretrained(str(bundle_dir))
@@ -386,7 +406,11 @@ def main():
     )
     parser.add_argument(
         "--model",
-        choices=["openai/whisper-large-v3-turbo", "openai/whisper-large-v3"],
+        choices=[
+            "openai/whisper-large-v3-turbo",
+            "openai/whisper-large-v3",
+            "openai/whisper-medium",
+        ],
         default="openai/whisper-large-v3-turbo",
         help="Model variant to convert.",
     )

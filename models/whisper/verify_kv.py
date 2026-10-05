@@ -32,9 +32,6 @@ import torch
 import transformers
 from coreai.runtime import AIModel, ComputeUnitKind, NDArray, SpecializationOptions
 
-EOS = 50257
-
-
 def _load_pcm(wav_path: str) -> np.ndarray:
     with wave.open(wav_path, "rb") as wf:
         if (
@@ -101,6 +98,7 @@ async def decode_coreai(
     features: np.ndarray,
     prefix: list[int],
     max_new: int,
+    eos: int,
     cache_fill: float,
 ) -> tuple[list[int], list[float], np.ndarray]:
     enc_out = (await enc_fn({"input_features": NDArray(features)}))[
@@ -143,12 +141,14 @@ async def decode_coreai(
         nxt = int(logits.reshape(-1).argmax())
         tokens.append(nxt)
         pos += 1
-        if nxt == EOS:
+        if nxt == eos:
             break
     return tokens, step_times, first_logits
 
 
-def decode_hf(hf, features: torch.Tensor, prefix: list[int], max_new: int):
+def decode_hf(
+    hf, features: torch.Tensor, prefix: list[int], max_new: int, eos: int
+):
     """Greedy reference, fed exactly what the runtime feeds."""
     with torch.no_grad():
         enc = hf.model.encoder(features).last_hidden_state
@@ -165,7 +165,7 @@ def decode_hf(hf, features: torch.Tensor, prefix: list[int], max_new: int):
                 first_logits = logits.float().numpy()
             nxt = int(logits.argmax(-1))
             generated.append(nxt)
-            if nxt == EOS:
+            if nxt == eos:
                 break
     return prefix + generated, first_logits
 
@@ -201,6 +201,7 @@ async def main() -> int:
     meta = json.loads((bundle / "metadata.json").read_text())
     prefix = [tok for _, tok in sorted(gen_cfg["forced_decoder_ids"])]
     max_new = args.max_new_tokens or gen_cfg["max_new_tokens"]
+    eos = gen_cfg["eos_token_id"]
     model_name = gen_cfg["tokenizer_name"]
 
     processor = transformers.AutoProcessor.from_pretrained(model_name)
@@ -225,12 +226,12 @@ async def main() -> int:
 
     t0 = time.perf_counter()
     tokens, step_times, coreai_logits = await decode_coreai(
-        enc_fn, dec_fn, features, prefix, max_new, cache_fill=0.0
+        enc_fn, dec_fn, features, prefix, max_new, eos, cache_fill=0.0
     )
     total = time.perf_counter() - t0
     tokenizer = processor.tokenizer
     text = tokenizer.decode(
-        [t for t in tokens if t < EOS], skip_special_tokens=True
+        [t for t in tokens if t < eos], skip_special_tokens=True
     ).strip()
     print(f"\n=== Transcript ({len(step_times)} steps, {total:.2f}s total) ===")
     print(" ", repr(text))
@@ -244,7 +245,7 @@ async def main() -> int:
 
     print("\n=== Uninitialized-cache safety ===")
     nan_tokens, _, _ = await decode_coreai(
-        enc_fn, dec_fn, features, prefix, max_new, cache_fill=np.nan
+        enc_fn, dec_fn, features, prefix, max_new, eos, cache_fill=np.nan
     )
     nan_match = nan_tokens == tokens
     print(f"  NaN-filled cache produces identical tokens: {nan_match}")
@@ -259,7 +260,7 @@ async def main() -> int:
         )
         hf.eval()
         hf_tokens, hf_logits = decode_hf(
-            hf, torch.tensor(features.astype(np.float32)), prefix, max_new
+            hf, torch.tensor(features.astype(np.float32)), prefix, max_new, eos
         )
         match = hf_tokens == tokens
         print(f"  token sequences identical: {match}")
@@ -269,11 +270,11 @@ async def main() -> int:
             print(f"  first divergence at index {first}")
             print(
                 "  coreai:",
-                repr(tokenizer.decode([t for t in tokens if t < EOS]).strip()),
+                repr(tokenizer.decode([t for t in tokens if t < eos]).strip()),
             )
             print(
                 "  hf    :",
-                repr(tokenizer.decode([t for t in hf_tokens if t < EOS]).strip()),
+                repr(tokenizer.decode([t for t in hf_tokens if t < eos]).strip()),
             )
             ok = False
         if coreai_logits is not None and hf_logits is not None:

@@ -31,7 +31,7 @@ uv run python models/whisper/export_kv.py --dtype float16 --overwrite
 
 | Flag | Description | Default |
 | --- | --- | --- |
-| `--model` | `openai/whisper-large-v3-turbo` or `openai/whisper-large-v3` | turbo |
+| `--model` | `openai/whisper-large-v3-turbo`, `openai/whisper-large-v3` or `openai/whisper-medium` | turbo |
 | `--output-dir` | Output directory for the bundle | `<repo-root>/exports/` |
 | `--dtype` | `float16`, `float32` — **no bfloat16** (see Limits) | `float16` |
 | `--overwrite` | Replace an existing bundle | — |
@@ -106,6 +106,16 @@ decoder.aimodel — entrypoint "main"
          valueCache            [4, 1, 20, 448, 64] f16
   out    logits                [1, 1, 51866]     f16
 ```
+
+Shapes above are for turbo. `whisper-medium` takes 80 mel bins, not 128, and has
+24 decoder layers at `d_model` 1024, so its encoder output is `[1, 1500, 49152]` and
+its cache `[24, 1, 16, 448, 64]`. The runtime reads the mel bin count from the
+encoder's `input_features` shape, so no Swift configuration is needed per variant.
+
+The forced prefix in `generation_config.json` is resolved through the model's own
+tokenizer rather than hardcoded: large-v3 inserted `<|yue|>` ahead of the control
+tokens, so `<|transcribe|>`/`<|notimestamps|>` are 50360/50364 on large-v3 but
+50359/50363 on medium.
 
 State names are `keyCache`/`valueCache` from `coreai_models._constants`, the same
 convention the LLM exports use, because `WhisperDecoder` looks them up by literal
@@ -200,6 +210,10 @@ relative to the Neural Engine. See [`FORK.md`](../../FORK.md).
 - **`whisper-large-v3`** has 32 decoder layers, so the packed encoder output is
   `[1, 1500, 81920]` ≈ 245 MB in fp16, passed as an input on every step. It exports,
   but turbo is the intended target.
+- **`whisper-medium`** has 24 decoder layers: the packed encoder output is
+  `[1, 1500, 49152]` ≈ 147 MB in fp16, and the decoder step is ~50 ms on CPU against
+  turbo's ~5 ms. Verified at token parity with HuggingFace (prefix-step logits
+  30.4 dB PSNR).
 - **No bfloat16.** The runtime fills `input_features` and reads `logits` through
   helpers that accept only float16 and float32.
 - Batched multi-window decoding is not exported; the Swift loads only `main`.
