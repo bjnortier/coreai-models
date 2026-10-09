@@ -68,6 +68,31 @@ public struct DecodeStats: Sendable {
 
     public let firstStep: FirstStep?
 
+    /// Wall-clock time spent outside the timed decoder steps, for benchmarking.
+    ///
+    /// `stepTimesMs` covers only the generated-token graph runs. These account for
+    /// the rest of a transcription, so a caller can see whether time goes to the
+    /// encoder, to the per-token runs, or to host-side work between them. Zero
+    /// where a stage did not run (Parakeet has no forced prefix or language step).
+    public struct Timing: Sendable, Equatable {
+        /// Mel spectrogram and encoder input preparation, on the CPU.
+        public var preprocessMs: Double = 0
+        /// Encoder graph runs.
+        public var encodeMs: Double = 0
+        /// Whisper language detection: its own encoder pass plus one decoder step.
+        public var languageDetectionMs: Double = 0
+        /// Whisper's forced-prefix decoder steps, run one token at a time.
+        public var prefixMs: Double = 0
+        /// Forced-prefix decoder steps taken.
+        public var prefixSteps = 0
+        /// Copying logits out and choosing the next token, after each generated step.
+        public var samplingMs: Double = 0
+
+        public init() {}
+    }
+
+    public var timing: Timing
+
     /// How many audio windows this transcription decoded.
     ///
     /// A static encoder (Whisper's is fixed at 30 s) can only see one window per
@@ -77,12 +102,13 @@ public struct DecodeStats: Sendable {
 
     public init(
         stepTimesMs: [Double], coverage: Coverage = Coverage(), firstStep: FirstStep? = nil,
-        windowCount: Int = 1
+        windowCount: Int = 1, timing: Timing = Timing()
     ) {
         self.stepTimesMs = stepTimesMs
         self.coverage = coverage
         self.firstStep = firstStep
         self.windowCount = windowCount
+        self.timing = timing
     }
 
     /// Combines per-window stats from a long-form transcription.
@@ -94,8 +120,15 @@ public struct DecodeStats: Sendable {
         if parts.count == 1 { return parts[0] }
         var times: [Double] = []
         var coverage = Coverage()
+        var timing = Timing()
         for part in parts {
             times.append(contentsOf: part.stepTimesMs)
+            timing.preprocessMs += part.timing.preprocessMs
+            timing.encodeMs += part.timing.encodeMs
+            timing.languageDetectionMs += part.timing.languageDetectionMs
+            timing.prefixMs += part.timing.prefixMs
+            timing.prefixSteps += part.timing.prefixSteps
+            timing.samplingMs += part.timing.samplingMs
             coverage.blankSkipReuses += part.coverage.blankSkipReuses
             coverage.lstmStateAdvances += part.coverage.lstmStateAdvances
             coverage.blankZeroDurationBreaks += part.coverage.blankZeroDurationBreaks
@@ -106,7 +139,7 @@ public struct DecodeStats: Sendable {
         }
         return DecodeStats(
             stepTimesMs: times, coverage: coverage,
-            firstStep: parts.first?.firstStep, windowCount: max(1, parts.count))
+            firstStep: parts.first?.firstStep, windowCount: max(1, parts.count), timing: timing)
     }
 
     public var stepCount: Int { stepTimesMs.count }
@@ -208,6 +241,23 @@ public struct WhisperDecoder: SpeechDecoder {
         validEncoderFrames: Int,
         resources: DecoderResources
     ) async throws -> (tokens: [Int32], stats: DecodeStats) {
+        try await decode(
+            encoderOutput: encoderOutput, encoderOutputShape: encoderOutputShape,
+            validEncoderFrames: validEncoderFrames, resources: resources, onToken: nil)
+    }
+
+    /// Greedy decode of one window, handing each generated token to `onToken` as it is chosen.
+    ///
+    /// The forced prefix is not reported, and neither is the closing `eotToken`. Cancellation
+    /// is checked before every decoder step, so a cancelled task stops within one step rather
+    /// than decoding the rest of the window.
+    public func decode(
+        encoderOutput: NDArray,
+        encoderOutputShape: [Int],
+        validEncoderFrames: Int,
+        resources: DecoderResources,
+        onToken: (@Sendable (Int32) async throws -> Void)?
+    ) async throws -> (tokens: [Int32], stats: DecodeStats) {
         // `validEncoderFrames` is ignored: Whisper is encoder-decoder and stops on
         // `eotToken`, not on encoder-frame exhaustion, so padded encoder frames don't
         // produce trailing tokens the way the Parakeet TDT frame loop does.
@@ -240,6 +290,7 @@ public struct WhisperDecoder: SpeechDecoder {
         let staticPositions = posIdsNDDesc.shape.last == 1
 
         func step(_ tok: Int32, pos: Int) async throws {
+            try Task.checkCancellation()
             var ids = NDArray(descriptor: inputIdsNDDesc.resolvingDynamicDimensions([1, 1]))
             fillNDArray(&ids, as: Int32.self, with: [tok])
             var posIds: NDArray
@@ -263,11 +314,16 @@ public struct WhisperDecoder: SpeechDecoder {
                 states: consume st, outputViews: consume out)
         }
 
+        var timing = DecodeStats.Timing()
+
         // Prime KV cache with forced prefix
         var tokens: [Int32] = config.forcedPrefix
+        let prefixStart = ContinuousClock.now
         for (i, tok) in config.forcedPrefix.enumerated() {
             try await step(tok, pos: i)
         }
+        timing.prefixMs = (ContinuousClock.now - prefixStart).inMilliseconds
+        timing.prefixSteps = config.forcedPrefix.count
 
         // Greedy decode
         var stepTimesMs: [Double] = []
@@ -275,14 +331,17 @@ public struct WhisperDecoder: SpeechDecoder {
         while tokens.count - config.forcedPrefix.count < config.maxDecodeSteps {
             let t0 = ContinuousClock.now
             try await step(tokens.last!, pos: pos)
-            stepTimesMs.append((ContinuousClock.now - t0).inMilliseconds)
+            let t1 = ContinuousClock.now
+            stepTimesMs.append((t1 - t0).inMilliseconds)
             let logits = flattenAsFloat(logitsArray)
             let next = Int32(logits.indices.max(by: { logits[$0] < logits[$1] })!)
+            timing.samplingMs += (ContinuousClock.now - t1).inMilliseconds
             tokens.append(next)
             pos += 1
             if next == config.eotToken { break }
+            try await onToken?(next)
         }
 
-        return (tokens: tokens, stats: DecodeStats(stepTimesMs: stepTimesMs))
+        return (tokens: tokens, stats: DecodeStats(stepTimesMs: stepTimesMs, timing: timing))
     }
 }

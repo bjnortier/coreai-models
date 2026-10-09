@@ -153,6 +153,7 @@ upstream streaming is for live audio, and costs more encoder work per second of 
 **Added:** `swift/Sources/CoreAISpeech/SpeechTranscriptionUpdate.swift`,
 `swift/Tests/SpeechTests/PartialTranscriptTests.swift`
 **Changed:** `swift/Sources/CoreAISpeech/ParakeetTDTDecoder.swift`,
+`swift/Sources/CoreAISpeech/SpeechDecoder.swift`,
 `swift/Sources/CoreAISpeech/SpeechRecognitionModel.swift`
 
 `transcribe(pcm:)` returned nothing until the last window was decoded. For a host
@@ -197,12 +198,30 @@ mode is a hook the modes can drift on. `SpeechRecognitionModel` only wires them
 up on the offline path.
 
 **Nothing changes for a caller that passes no `onPartial`.** `tokenReporter`
-returns `nil` unless the decoder is a `ParakeetTDTDecoder`, and `decodeAudio`
-enters the reporting branch only when there is a reporter or a non-zero
-`resetAfterSilenceFrames`, so a Whisper bundle and an unhooked Parakeet run take
-exactly the path they took before and pay nothing — the parity traces are
-unaffected. Whisper bundles do still get `.window` updates when they ask for
-them, since only a transducer can report mid-window.
+returns `nil` without one, and `decodeAudio` enters a reporting branch only when
+there is a reporter (or, for Parakeet, a non-zero `resetAfterSilenceFrames`), so
+an unhooked run takes exactly the path it took before and pays nothing — the
+parity traces are unaffected.
+
+**Whisper reports decoder text too.** `WhisperDecoder.decode` has an overload
+taking `onToken`, called with each greedily chosen token after the forced prefix
+and before `eotToken`; `decodeAudio` wires it to the same `SpeechTokenReporter`,
+so a Whisper update is the same whole-transcript snapshot at the same 20 Hz cap.
+Its progress is the honest part: Whisper's tokens carry no alignment to encoder
+frames (there are no timestamp tokens in the forced prefix), so the reporter's
+frame count never advances mid-window and `.decoder` updates hold at the previous
+window's end. Progress moves when each `.window` update arrives.
+
+**Cancellation.** The window loop in `transcribe(pcm:)` checks
+`Task.checkCancellation()` before each window, and `WhisperDecoder` checks it
+before every decoder step, forced prefix included. Parakeet already stopped at
+the next token through `SpeechTokenReporter.append`, but only when a reporter
+was attached; Whisper ignored cancellation entirely and decoded every remaining
+window, so a cancelled long file cost as much as a finished one. One graph run in
+flight (an encoder pass, a decoder step) still completes. Measured with
+`whisper-large-v3-kv_float16` on a Mac, on a 5 min file (`steve.wav` repeated
+five times): 137 s uncancelled; cancelled at the first decoder update, the call
+threw `CancellationError` 1.2 ms later.
 
 `speech-recognizer` does not surface these; it prints one transcript at the end.
 The consumer is a host app — CirceKit passes `onPartial` through to

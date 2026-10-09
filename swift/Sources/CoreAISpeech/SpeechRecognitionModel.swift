@@ -190,14 +190,17 @@ public actor SpeechRecognitionModel {
         onPartial: (@Sendable (SpeechTranscriptionUpdate) -> Void)? = nil
     ) async throws -> (String, DecodeStats) {
         guard let windowSamples = staticWindowSamples, pcm.count > windowSamples else {
+            let resolveStart = ContinuousClock.now
             let resolved = try await resolvedResources(
                 forLeadingPCM: pcm, language: language, task: task)
+            let languageDetectionMs = (ContinuousClock.now - resolveStart).inMilliseconds
             let reporter = tokenReporter(
                 completedTexts: [], windowIndex: 0, windowCount: 1,
                 startSample: 0, endSample: pcm.count, previousEndSample: 0, totalSamples: pcm.count, emit: onPartial)
-            let (tokens, stats) = try await decodeAudio(
+            var (tokens, stats) = try await decodeAudio(
                 pcm: pcm, resources: resolved,
                 resetAfterSilenceFrames: resetAfterSilenceFrames, reporter: reporter)
+            stats.timing.languageDetectionMs = languageDetectionMs
             let text = try detokenize(tokens)
             onPartial?(SpeechTranscriptionUpdate(text: text, source: .window, windowIndex: 0, windowCount: 1, progress: 1))
             return (text, stats)
@@ -211,12 +214,16 @@ public actor SpeechRecognitionModel {
         // cost a step each time and let a noisy window flip the language
         // mid-transcript, producing a hybrid transcript from a monolingual file.
         let firstEnd = min(starts[0] + windowSamples, pcm.count)
+        let resolveStart = ContinuousClock.now
         let resolved = try await resolvedResources(
             forLeadingPCM: Array(pcm[starts[0]..<firstEnd]), language: language, task: task)
+        let languageDetectionMs = (ContinuousClock.now - resolveStart).inMilliseconds
 
         var texts: [String] = []
         var stats: [DecodeStats] = []
         for (index, start) in starts.enumerated() {
+            // Each window is a full encoder pass; a cancelled task should not start another.
+            try Task.checkCancellation()
             let end = min(start + windowSamples, pcm.count)
             let previousEnd = index == 0 ? 0 : min(starts[index - 1] + windowSamples, pcm.count)
             let reporter = tokenReporter(
@@ -232,7 +239,9 @@ public actor SpeechRecognitionModel {
                 text: LongForm.stitch(texts), source: .window, windowIndex: index, windowCount: starts.count,
                 progress: Double(end) / Double(pcm.count)))
         }
-        return (LongForm.stitch(texts), DecodeStats.merged(stats))
+        var merged = DecodeStats.merged(stats)
+        merged.timing.languageDetectionMs = languageDetectionMs
+        return (LongForm.stitch(texts), merged)
     }
 
     /// The language this request would decode as, as a code such as `"fr"`.
@@ -398,6 +407,16 @@ public actor SpeechRecognitionModel {
     /// streaming path deliberately zero-fills its ramp-up windows first, so that a frame's
     /// representation does not shift as the window fills — see `runHopIfReady`.
     package func runEncoder(pcm: [Float]) async throws -> (NDArray, [Int], Int) {
+        let (encOut, encShape, validEnc, _) = try await runEncoderTimed(pcm: pcm)
+        return (encOut, encShape, validEnc)
+    }
+
+    /// ``runEncoder(pcm:)``, also returning how long preprocessing and the encoder run took.
+    ///
+    /// Only `preprocessMs` and `encodeMs` are set on the returned timing.
+    private func runEncoderTimed(
+        pcm: [Float]
+    ) async throws -> (NDArray, [Int], Int, DecodeStats.Timing) {
         let start = ContinuousClock.now
         let mel = MelSpectrogram.fromPCM(pcm, config: melConfig, basis: melBasis)
         let nFrames = MelSpectrogram.frameCount(forPCMLength: pcm.count, config: melConfig)
@@ -432,7 +451,10 @@ public actor SpeechRecognitionModel {
         let validEnc = Self.validEncoderFrames(
             pcmCount: pcm.count, tEnc: encOut.shape[1], config: melConfig,
             subsamplingFactor: tdtConfig?.encoderSubsamplingFactor ?? 1)
-        return (encOut, encOut.shape, validEnc)
+        var timing = DecodeStats.Timing()
+        timing.preprocessMs = preprocessDuration.inMilliseconds
+        timing.encodeMs = encodeDuration.inMilliseconds
+        return (encOut, encOut.shape, validEnc, timing)
     }
 
     private func encoderInputShape(nFrames: Int) -> [Int] {
@@ -456,7 +478,9 @@ public actor SpeechRecognitionModel {
         startSample: Int, endSample: Int, previousEndSample: Int, totalSamples: Int,
         emit: (@Sendable (SpeechTranscriptionUpdate) -> Void)?
     ) -> SpeechTokenReporter? {
-        guard let emit, decoder is ParakeetTDTDecoder else { return nil }
+        guard let emit, decoder is ParakeetTDTDecoder || decoder is WhisperDecoder else { return nil }
+        // Whisper reports no frame progress mid-window, having no alignment between tokens and
+        // audio, so its decoder updates hold at the previous window's end until this one completes.
         return SpeechTokenReporter(
             completedTexts: completedTexts, windowIndex: windowIndex, windowCount: windowCount,
             audioProgress: SpeechDecodeProgress(
@@ -473,7 +497,20 @@ public actor SpeechRecognitionModel {
         pcm: [Float], resources: DecoderResources? = nil, resetAfterSilenceFrames: Int = 0,
         reporter: SpeechTokenReporter? = nil
     ) async throws -> ([Int32], DecodeStats) {
-        let (encOut, encShape, validEnc) = try await runEncoder(pcm: pcm)
+        let (encOut, encShape, validEnc, encoderTiming) = try await runEncoderTimed(pcm: pcm)
+        var (tokens, stats) = try await decodeEncoded(
+            encOut: encOut, encShape: encShape, validEnc: validEnc, resources: resources,
+            resetAfterSilenceFrames: resetAfterSilenceFrames, reporter: reporter)
+        stats.timing.preprocessMs = encoderTiming.preprocessMs
+        stats.timing.encodeMs = encoderTiming.encodeMs
+        return (tokens, stats)
+    }
+
+    /// The decoder half of ``decodeAudio(pcm:resources:resetAfterSilenceFrames:reporter:)``.
+    private func decodeEncoded(
+        encOut: NDArray, encShape: [Int], validEnc: Int, resources: DecoderResources?,
+        resetAfterSilenceFrames: Int, reporter: SpeechTokenReporter?
+    ) async throws -> ([Int32], DecodeStats) {
         let effectiveResources = resources ?? self.resources
         // Not on `SpeechDecoder`, so reached by downcast the way `startStream` does. Thrown
         // rather than ignored elsewhere: silently dropping a flag the caller passed is how a
@@ -500,6 +537,14 @@ public actor SpeechRecognitionModel {
                 resources: effectiveResources,
                 resetAfterSilenceFrames: resetAfterSilenceFrames,
                 onToken: onToken, onProgress: onProgress)
+        }
+        if let reporter, let whisper = decoder as? WhisperDecoder {
+            return try await whisper.decode(
+                encoderOutput: encOut,
+                encoderOutputShape: encShape,
+                validEncoderFrames: validEnc,
+                resources: effectiveResources,
+                onToken: { token in try await reporter.append(token) })
         }
         return try await decoder.decode(
             encoderOutput: encOut,

@@ -183,4 +183,30 @@ struct LongFormStatsTests {
         #expect(merged.coverage.multiTokenSteps == 1)
         #expect(merged.coverage.blankOnlySteps == 4)
     }
+
+    @Test("Stage timings sum across windows")
+    func timingSums() {
+        var a = DecodeStats.Timing()
+        a.preprocessMs = 1
+        a.encodeMs = 10
+        a.prefixMs = 4
+        a.prefixSteps = 4
+        a.samplingMs = 2
+        var b = DecodeStats.Timing()
+        b.preprocessMs = 2
+        b.encodeMs = 20
+        b.prefixMs = 5
+        b.prefixSteps = 4
+        b.samplingMs = 3
+        let merged = DecodeStats.merged([
+            DecodeStats(stepTimesMs: [1], timing: a),
+            DecodeStats(stepTimesMs: [2], timing: b),
+        ])
+        #expect(merged.timing.preprocessMs == 3)
+        #expect(merged.timing.encodeMs == 30)
+        #expect(merged.timing.prefixMs == 9)
+        #expect(merged.timing.prefixSteps == 8)
+        #expect(merged.timing.samplingMs == 5)
+        #expect(merged.timing.languageDetectionMs == 0)
+    }
 }
