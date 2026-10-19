@@ -93,6 +93,28 @@ public struct DecodeStats: Sendable {
 
     public var timing: Timing
 
+    /// Where one emitted token sits in the encoder output.
+    ///
+    /// `frame` is the encoder frame the token was emitted at and `duration` the frame count
+    /// TDT predicted alongside it, both relative to the decoded window. HF
+    /// `ParakeetProcessor.decode(..., durations=...)` builds word timestamps from exactly
+    /// these: start `frame`, end `frame + duration`.
+    public struct TokenTiming: Sendable, Equatable {
+        public let token: Int32
+        public let frame: Int
+        public let duration: Int
+    }
+
+    /// One entry per emitted token, in order. Empty for Whisper, and for stats merged across
+    /// long-form windows, whose frames would each be relative to a different window.
+    public var tokenTimings: [TokenTiming]
+
+    /// Whisper's alignment-head scores for every generated step, when the decode was asked to
+    /// keep them. Whisper's counterpart to `tokenTimings`: its tokens carry no frame, so word
+    /// times are warped out of these instead (see `WhisperAlignment`). `nil` otherwise, and
+    /// for stats merged across windows.
+    package var alignment: WhisperAlignment.Scores?
+
     /// How many audio windows this transcription decoded.
     ///
     /// A static encoder (Whisper's is fixed at 30 s) can only see one window per
@@ -102,13 +124,14 @@ public struct DecodeStats: Sendable {
 
     public init(
         stepTimesMs: [Double], coverage: Coverage = Coverage(), firstStep: FirstStep? = nil,
-        windowCount: Int = 1, timing: Timing = Timing()
+        windowCount: Int = 1, timing: Timing = Timing(), tokenTimings: [TokenTiming] = []
     ) {
         self.stepTimesMs = stepTimesMs
         self.coverage = coverage
         self.firstStep = firstStep
         self.windowCount = windowCount
         self.timing = timing
+        self.tokenTimings = tokenTimings
     }
 
     /// Combines per-window stats from a long-form transcription.
@@ -251,12 +274,17 @@ public struct WhisperDecoder: SpeechDecoder {
     /// The forced prefix is not reported, and neither is the closing `eotToken`. Cancellation
     /// is checked before every decoder step, so a cancelled task stops within one step rather
     /// than decoding the rest of the window.
+    ///
+    /// - Parameter capturesAlignment: also keep each generated step's `alignment_logits` in
+    ///   `stats.alignment`, for word timestamps. Throws if the decoder was exported without
+    ///   them.
     public func decode(
         encoderOutput: NDArray,
         encoderOutputShape: [Int],
         validEncoderFrames: Int,
         resources: DecoderResources,
-        onToken: (@Sendable (Int32) async throws -> Void)?
+        onToken: (@Sendable (Int32) async throws -> Void)?,
+        capturesAlignment: Bool = false
     ) async throws -> (tokens: [Int32], stats: DecodeStats) {
         // `validEncoderFrames` is ignored: Whisper is encoder-decoder and stops on
         // `eotToken`, not on encoder-frame exhaustion, so padded encoder frames don't
@@ -285,6 +313,24 @@ public struct WhisperDecoder: SpeechDecoder {
         var valueCache = NDArray(descriptor: valCacheNDDesc.resolvingDynamicDimensions(vcShape))
         var logitsArray = NDArray(descriptor: logitsNDDesc.resolvingDynamicDimensions([1, 1, vocabSize]))
 
+        // `[1, heads, frames]`, bound only when asked for: the graph computes it every step
+        // regardless, but copying it out is wasted work for a plain transcription.
+        // A placeholder until then, since a view has to be bound to a non-optional array.
+        var alignmentArray = NDArray(shape: [1], scalarType: .float32)
+        var alignment: WhisperAlignment.Scores?
+        if capturesAlignment {
+            guard decDesc.outputNames.contains(Self.alignmentOutputName),
+                case .ndArray(let desc) = decDesc.outputDescriptor(of: Self.alignmentOutputName),
+                desc.shape.count == 3, desc.shape.allSatisfy({ $0 > 0 })
+            else {
+                throw SpeechError.incompatibleResources(
+                    "This Whisper decoder has no '\(Self.alignmentOutputName)' output, so it cannot "
+                        + "time words. Re-export the bundle with models/whisper/export_kv.py.")
+            }
+            alignmentArray = NDArray(descriptor: desc)
+            alignment = WhisperAlignment.Scores(heads: desc.shape[1], frames: desc.shape[2])
+        }
+
         // A `--static-positions` export fixes `position_ids` at [1, 1] and takes the current
         // position alone; the dynamic export takes 0...pos, whose length is the cache length.
         let staticPositions = posIdsNDDesc.shape.last == 1
@@ -301,17 +347,22 @@ public struct WhisperDecoder: SpeechDecoder {
                 posIds = NDArray(descriptor: posIdsNDDesc.resolvingDynamicDimensions([1, pos + 1]))
                 fillNDArray(&posIds, as: Int32.self, count: pos + 1) { Int32($0) }
             }
+            let inputs: [String: NDArray] = [
+                "input_ids": ids, "position_ids": posIds,
+                "encoder_hidden_states": encoderOutput,
+            ]
             var st = InferenceFunction.MutableViews()
             st.insert(&keyCache, for: "keyCache")
             st.insert(&valueCache, for: "valueCache")
             var out = InferenceFunction.MutableViews()
             out.insert(&logitsArray, for: "logits")
-            _ = try await decFn.run(
-                inputs: [
-                    "input_ids": ids, "position_ids": posIds,
-                    "encoder_hidden_states": encoderOutput,
-                ],
-                states: consume st, outputViews: consume out)
+            // two calls rather than a conditional insert, which the views' lifetime check rejects
+            guard alignment != nil else {
+                _ = try await decFn.run(inputs: inputs, states: consume st, outputViews: consume out)
+                return
+            }
+            out.insert(&alignmentArray, for: Self.alignmentOutputName)
+            _ = try await decFn.run(inputs: inputs, states: consume st, outputViews: consume out)
         }
 
         var timing = DecodeStats.Timing()
@@ -335,6 +386,8 @@ public struct WhisperDecoder: SpeechDecoder {
             stepTimesMs.append((t1 - t0).inMilliseconds)
             let logits = flattenAsFloat(logitsArray)
             let next = Int32(logits.indices.max(by: { logits[$0] < logits[$1] })!)
+            // one row per generated token, eot included: it is what ends the last word
+            if alignment != nil { alignment!.values += flattenAsFloat(alignmentArray) }
             timing.samplingMs += (ContinuousClock.now - t1).inMilliseconds
             tokens.append(next)
             pos += 1
@@ -342,6 +395,11 @@ public struct WhisperDecoder: SpeechDecoder {
             try await onToken?(next)
         }
 
-        return (tokens: tokens, stats: DecodeStats(stepTimesMs: stepTimesMs, timing: timing))
+        var stats = DecodeStats(stepTimesMs: stepTimesMs, timing: timing)
+        stats.alignment = alignment
+        return (tokens: tokens, stats: stats)
     }
+
+    /// The decoder output `export_kv.py` writes the alignment heads' cross-attention scores to.
+    package static let alignmentOutputName = "alignment_logits"
 }

@@ -34,6 +34,9 @@ public struct MelConfig: Sendable {
         /// Per-mel-bin mean/std over time with Bessel correction. NeMo `per_feature`
         /// convention; matches HF `ParakeetFeatureExtractor`.
         case perBinMeanStd
+        /// Natural-log mel as is. HF `NemotronAsrStreamingFeatureExtractor` (Nemotron-3-Diarization)
+        /// never normalizes, which is what lets its streaming chunks reproduce a full pass.
+        case none
     }
 
     public enum Layout: Sendable {
@@ -118,6 +121,15 @@ public struct MelConfig: Sendable {
         sampleRate: 16_000, nFFT: 512, winLength: 400, hopLength: 160,
         nMelBins: 128, nFrames: nil, preemphasis: 0.97,
         normalization: .perBinMeanStd, layout: .timeMajor,
+        padMode: .constant, melScale: .slaney, windowPeriodicity: .symmetric)
+
+    /// Nemotron-3-Diarization parameters: Parakeet's front end without the normalization, matching
+    /// HF `NemotronAsrStreamingFeatureExtractor` (Slaney, symmetric 400-sample Hann in a 512 FFT,
+    /// 0.97 pre-emphasis, `log(mel + 2^-24)`).
+    public static let nemotronDiarization = MelConfig(
+        sampleRate: 16_000, nFFT: 512, winLength: 400, hopLength: 160,
+        nMelBins: 128, nFrames: nil, preemphasis: 0.97,
+        normalization: .none, layout: .timeMajor,
         padMode: .constant, melScale: .slaney, windowPeriodicity: .symmetric)
 
     /// A copy of this config with `nFrames` replaced.
@@ -501,6 +513,8 @@ public enum MelSpectrogram {
             (layout == .timeMajor) ? (t * nMelBins + b) : (b * totalFrames + t)
         }
         switch normalization {
+        case .none:
+            return
         case .whisperLogClip:
             // Whisper fills its entire fixed window (see `framesToCompute`), so every
             // entry is real log-mel data — including the log-silence tail for sub-window

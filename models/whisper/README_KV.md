@@ -52,6 +52,10 @@ Drives the Core AI graphs exactly the way the Swift loop drives them and checks:
    Identical tokens prove the graph never reads a slot it did not write. This is
    not hypothetical: the runtime really does hand the decoder uninitialized state.
 3. **Timing** — per-step decode latency.
+4. **Word alignment** — the decoder's `alignment_logits` against HuggingFace's eager
+   cross-attention on the same heads, and the word times dynamic time warping derives
+   from each (see below). `--words-json <file>` also writes the Core AI words, which
+   is what CirceKit's Swift test was pinned to.
 
 ## Run
 
@@ -106,12 +110,15 @@ decoder.aimodel — entrypoint "main"
   state  keyCache              [4, 1, 20, 448, 64] f16
          valueCache            [4, 1, 20, 448, 64] f16
   out    logits                [1, 1, 51866]     f16
+         alignment_logits      [1, 6, 1500]      f16     alignment heads' cross-attention scores
 ```
 
 Shapes above are for turbo. `whisper-medium` takes 80 mel bins, not 128, and has
 24 decoder layers at `d_model` 1024, so its encoder output is `[1, 1500, 49152]` and
 its cache `[24, 1, 16, 448, 64]`. The runtime reads the mel bin count from the
 encoder's `input_features` shape, so no Swift configuration is needed per variant.
+`alignment_logits` has one row per alignment head: 6 for turbo and medium, 10 for
+large-v3. The runtime reads that count from the output's shape too.
 
 The forced prefix in `generation_config.json` is resolved through the model's own
 tokenizer rather than hardcoded: large-v3 inserted `<|yue|>` ahead of the control
@@ -160,6 +167,23 @@ states, and a future upstream Whisper encoder will not be a drop-in for it. The
 Rejected alternative: extra `crossKeyCache`/`crossValueCache` Core AI states. The
 Swift binds only `keyCache` and `valueCache`, so a graph declaring more states would
 fail at `run(states:)`.
+
+## Word timestamps: `alignment_logits`
+
+The decoder's second output is the pre-softmax cross-attention score of each
+`(layer, head)` in the model's `generation_config.alignment_heads` (turbo:
+`[2,4] [2,11] [3,3] [3,6] [3,11] [3,14]`, recorded in `metadata.json`), for the token
+just fed. `SpeechRecognitionModel.transcribeWords` collects one row per generated token
+and aligns tokens to encoder frames by dynamic time warping, exactly as openai-whisper's
+`word_timestamps=True` does (`CoreAISpeech/WhisperAlignment.swift`); `verify_kv.py`
+checks it against HF.
+
+The fused SDPA returns no attention weights, so the export recomputes `q · kᵀ / √d` for
+just those heads beside it. Unnormalized on purpose: openai-whisper crops to the frames
+real audio backs *before* the softmax, and the graph does not know where that is.
+
+A bundle exported before this output existed still transcribes; asking it for words
+throws, naming the re-export.
 
 ## Two runtime behaviours the export is built around
 

@@ -189,59 +189,10 @@ public actor SpeechRecognitionModel {
         resetAfterSilenceFrames: Int = 0,
         onPartial: (@Sendable (SpeechTranscriptionUpdate) -> Void)? = nil
     ) async throws -> (String, DecodeStats) {
-        guard let windowSamples = staticWindowSamples, pcm.count > windowSamples else {
-            let resolveStart = ContinuousClock.now
-            let resolved = try await resolvedResources(
-                forLeadingPCM: pcm, language: language, task: task)
-            let languageDetectionMs = (ContinuousClock.now - resolveStart).inMilliseconds
-            let reporter = tokenReporter(
-                completedTexts: [], windowIndex: 0, windowCount: 1,
-                startSample: 0, endSample: pcm.count, previousEndSample: 0, totalSamples: pcm.count, emit: onPartial)
-            var (tokens, stats) = try await decodeAudio(
-                pcm: pcm, resources: resolved,
-                resetAfterSilenceFrames: resetAfterSilenceFrames, reporter: reporter)
-            stats.timing.languageDetectionMs = languageDetectionMs
-            let text = try detokenize(tokens)
-            onPartial?(SpeechTranscriptionUpdate(text: text, source: .window, windowIndex: 0, windowCount: 1, progress: 1))
-            return (text, stats)
-        }
-        let overlapSamples = Int(max(0, overlapSeconds) * melConfig.sampleRate)
-        let starts = LongForm.windowStarts(
-            pcmCount: pcm.count, windowSamples: windowSamples, overlapSamples: overlapSamples)
-
-        // Detect once, on the first window, and reuse it for the rest: a recording
-        // is almost always one language, and re-detecting per window would both
-        // cost a step each time and let a noisy window flip the language
-        // mid-transcript, producing a hybrid transcript from a monolingual file.
-        let firstEnd = min(starts[0] + windowSamples, pcm.count)
-        let resolveStart = ContinuousClock.now
-        let resolved = try await resolvedResources(
-            forLeadingPCM: Array(pcm[starts[0]..<firstEnd]), language: language, task: task)
-        let languageDetectionMs = (ContinuousClock.now - resolveStart).inMilliseconds
-
-        var texts: [String] = []
-        var stats: [DecodeStats] = []
-        for (index, start) in starts.enumerated() {
-            // Each window is a full encoder pass; a cancelled task should not start another.
-            try Task.checkCancellation()
-            let end = min(start + windowSamples, pcm.count)
-            let previousEnd = index == 0 ? 0 : min(starts[index - 1] + windowSamples, pcm.count)
-            let reporter = tokenReporter(
-                completedTexts: texts, windowIndex: index, windowCount: starts.count,
-                startSample: start, endSample: end, previousEndSample: previousEnd,
-                totalSamples: pcm.count, emit: onPartial)
-            let (tokens, windowStats) = try await decodeAudio(
-                pcm: Array(pcm[start..<end]), resources: resolved,
-                resetAfterSilenceFrames: resetAfterSilenceFrames, reporter: reporter)
-            texts.append(try detokenize(tokens))
-            stats.append(windowStats)
-            onPartial?(SpeechTranscriptionUpdate(
-                text: LongForm.stitch(texts), source: .window, windowIndex: index, windowCount: starts.count,
-                progress: Double(end) / Double(pcm.count)))
-        }
-        var merged = DecodeStats.merged(stats)
-        merged.timing.languageDetectionMs = languageDetectionMs
-        return (LongForm.stitch(texts), merged)
+        let decoded = try await decodeWindows(
+            pcm: pcm, overlapSeconds: overlapSeconds, language: language, task: task,
+            resetAfterSilenceFrames: resetAfterSilenceFrames, timesWords: false, onPartial: onPartial)
+        return (decoded.text, decoded.stats)
     }
 
     /// The language this request would decode as, as a code such as `"fr"`.
@@ -332,6 +283,197 @@ public actor SpeechRecognitionModel {
     private var staticWindowSamples: Int? {
         guard let nFrames = melConfig.nFrames else { return nil }
         return nFrames * melConfig.hopLength
+    }
+
+    // MARK: - Word timestamps
+
+    /// Transcribes `pcm` into words with start and end times in seconds.
+    ///
+    /// Parakeet TDT times words from the decoder's token timings, the same way HF
+    /// `ParakeetProcessor.decode(..., durations=...)` derives them: a token spans
+    /// `frame ..< frame + duration` encoder frames, a word spans its tokens, and punctuation
+    /// takes no time of its own. Whisper's tokens carry no time, so its words are aligned from
+    /// the decoder's alignment-head cross-attention instead, as openai-whisper and HF do (see
+    /// `WhisperAlignment`). That needs a decoder `export_kv.py` exported with
+    /// `alignment_logits`; an older Whisper bundle throws.
+    ///
+    /// Audio longer than a static encoder's window is decoded as windows overlapping by
+    /// `overlapSeconds`, and each overlap is split at its midpoint: a word belongs to the
+    /// window its start falls in. That is a seam by time rather than the text matching
+    /// `transcribe` uses, so a word straddling the midpoint can be lost or doubled, but every
+    /// word keeps its own time.
+    ///
+    /// `language`, `task` and `resetAfterSilenceFrames` mean what they do for
+    /// ``transcribe(pcm:overlapSeconds:language:task:resetAfterSilenceFrames:onPartial:)``. A
+    /// translation is timed as openai-whisper times one: each English word is placed where the
+    /// alignment heads attend in the spoken audio, which is only as good as the two languages'
+    /// word orders agree.
+    /// - Parameter onPartial: receives the same updates `transcribe` sends: decoder snapshots
+    ///   during each window and a `.window` snapshot as each completes, as untimed text
+    ///   stitched by matching words. The words returned are seamed by time, so the last
+    ///   snapshot can differ from them at a seam.
+    public func transcribeWords(
+        pcm: [Float],
+        overlapSeconds: Double = SpeechRecognitionModel.defaultOverlapSeconds,
+        language: SpeechLanguage = .detect,
+        task: SpeechTask = .transcribe,
+        resetAfterSilenceFrames: Int = 0,
+        onPartial: (@Sendable (SpeechTranscriptionUpdate) -> Void)? = nil
+    ) async throws -> (words: [TimedWord], stats: DecodeStats) {
+        let decoded = try await decodeWindows(
+            pcm: pcm, overlapSeconds: overlapSeconds, language: language, task: task,
+            resetAfterSilenceFrames: resetAfterSilenceFrames, timesWords: true, onPartial: onPartial)
+        return (decoded.words, decoded.stats)
+    }
+
+    /// What ``decodeWindows(pcm:overlapSeconds:language:task:resetAfterSilenceFrames:timesWords:onPartial:)``
+    /// decoded.
+    private struct WindowedDecode {
+        /// The windows' text, joined by matching words at each seam. Empty when only words were
+        /// asked for and nobody wanted the snapshots it is otherwise built for.
+        var text: String
+        /// Every word with its time, seamed by time. Empty unless words were asked for.
+        var words: [TimedWord]
+        var stats: DecodeStats
+    }
+
+    /// The decode behind both `transcribe` and `transcribeWords`: split into windows, resolve
+    /// the language once, decode each window reporting partials, and join the windows as text,
+    /// as timed words, or both.
+    private func decodeWindows(
+        pcm: [Float], overlapSeconds: Double, language: SpeechLanguage, task: SpeechTask,
+        resetAfterSilenceFrames: Int, timesWords: Bool,
+        onPartial: (@Sendable (SpeechTranscriptionUpdate) -> Void)?
+    ) async throws -> WindowedDecode {
+        // Checked before any audio is decoded, rather than after the first window.
+        var wordTokenizer: (any Tokenizer)?
+        if timesWords {
+            guard let tokenizer = bundle.tokenizer else { throw SpeechError.missingTokenizer }
+            guard decoder is WhisperDecoder || tdtConfig != nil else {
+                throw SpeechError.incompatibleResources("\(architecture) cannot time words")
+            }
+            wordTokenizer = tokenizer
+        }
+        let sampleRate = melConfig.sampleRate
+
+        var starts = [0]
+        var windowSamples = pcm.count
+        if let staticSamples = staticWindowSamples, pcm.count > staticSamples {
+            windowSamples = staticSamples
+            starts = LongForm.windowStarts(
+                pcmCount: pcm.count, windowSamples: staticSamples,
+                overlapSamples: Int(max(0, overlapSeconds) * sampleRate))
+        }
+
+        // Detect once, on the first window, and reuse it for the rest: a recording
+        // is almost always one language, and re-detecting per window would both
+        // cost a step each time and let a noisy window flip the language
+        // mid-transcript, producing a hybrid transcript from a monolingual file.
+        let resolveStart = ContinuousClock.now
+        let resolved = try await resolvedResources(
+            forLeadingPCM: Array(pcm[0..<min(windowSamples, pcm.count)]), language: language, task: task)
+        let languageDetectionMs = (ContinuousClock.now - resolveStart).inMilliseconds
+
+        // Timed words carry their own text; the stitched text is then only for the snapshots.
+        let keepsText = !timesWords || onPartial != nil
+        // A single window's text is returned as decoded; stitching normalizes its spacing.
+        func joined(_ texts: [String]) -> String { starts.count == 1 ? texts[0] : LongForm.stitch(texts) }
+        var texts: [String] = []
+        var words: [TimedWord] = []
+        var stats: [DecodeStats] = []
+        for (index, start) in starts.enumerated() {
+            // Each window is a full encoder pass; a cancelled task should not start another.
+            try Task.checkCancellation()
+            let end = min(start + windowSamples, pcm.count)
+            let previousEnd = index == 0 ? 0 : min(starts[index - 1] + windowSamples, pcm.count)
+            let reporter = tokenReporter(
+                completedTexts: texts, windowIndex: index, windowCount: starts.count,
+                startSample: start, endSample: end, previousEndSample: previousEnd,
+                totalSamples: pcm.count, emit: onPartial)
+            let (tokens, windowStats) = try await decodeAudio(
+                pcm: Array(pcm[start..<end]), resources: resolved,
+                resetAfterSilenceFrames: resetAfterSilenceFrames, reporter: reporter,
+                capturesAlignment: timesWords)
+            stats.append(windowStats)
+            if keepsText {
+                texts.append(try detokenize(tokens))
+                onPartial?(SpeechTranscriptionUpdate(
+                    text: joined(texts), source: .window, windowIndex: index, windowCount: starts.count,
+                    progress: Double(end) / Double(pcm.count)))
+            }
+            guard let wordTokenizer else { continue }
+
+            // the stretch of the recording this window owns: from the middle of the overlap with
+            // the previous window to the middle of the overlap with the next
+            let lower = index > 0 ? Double(start + previousEnd) / 2 / sampleRate : 0
+            let upper =
+                index + 1 < starts.count
+                ? Double(starts[index + 1] + end) / 2 / sampleRate : Double.infinity
+            let offset = Double(start) / sampleRate
+            let windowWords = windowWords(
+                tokens: tokens, stats: windowStats, sampleCount: end - start, resources: resolved,
+                tokenizer: wordTokenizer)
+            for word in windowWords where (lower..<upper).contains(word.start + offset) {
+                words.append(TimedWord(text: word.text, start: word.start + offset, end: word.end + offset))
+            }
+        }
+        var merged = DecodeStats.merged(stats)
+        merged.timing.languageDetectionMs = languageDetectionMs
+        return WindowedDecode(text: keepsText ? joined(texts) : "", words: words, stats: merged)
+    }
+
+    /// One window's words, relative to the window: Whisper's aligned from its alignment heads,
+    /// Parakeet's from its token timings.
+    private func windowWords(
+        tokens: [Int32], stats: DecodeStats, sampleCount: Int, resources: DecoderResources,
+        tokenizer: any Tokenizer
+    ) -> [TimedWord] {
+        guard case .whisper(_, let config) = resources else {
+            guard let tdtConfig else { return [] }
+            return Self.words(
+                from: stats.tokenTimings, tokenizer: tokenizer,
+                secondsPerFrame: Double(melConfig.hopLength * tdtConfig.encoderSubsamplingFactor)
+                    / melConfig.sampleRate)
+        }
+        guard let alignment = stats.alignment else { return [] }
+
+        // openai-whisper crops the attention to `num_frames // 2`, the encoder frames the
+        // unpadded mel backs
+        let melFrames = min(sampleCount / melConfig.hopLength, melConfig.nFrames ?? .max)
+        let validFrames = min(max(1, melFrames / 2), alignment.frames)
+        let language = config.languageToken.flatMap { bundle.languageTokens.codeByID[$0] }
+        return WhisperAlignment.words(
+            tokens: Array(tokens.dropFirst(config.forcedPrefix.count)),
+            frames: WhisperAlignment.tokenFrames(alignment, validFrames: validFrames),
+            eot: config.eotToken, endFrame: validFrames,
+            splitsOnSpaces: !WhisperAlignment.unspacedLanguages.contains(language ?? "")
+        ) { tokenizer.decode(tokens: $0) }
+    }
+
+    /// Groups timed tokens into words. A SentencePiece piece opening with `▁` starts a word;
+    /// any other piece continues the current one.
+    package static func words(
+        from timings: [DecodeStats.TokenTiming], tokenizer: any Tokenizer, secondsPerFrame: Double
+    ) -> [TimedWord] {
+        var words: [TimedWord] = []
+        for timing in timings {
+            guard let piece = tokenizer.convertIdToToken(Int(timing.token)) else { continue }
+            let start = Double(timing.frame) * secondsPerFrame
+            let end = Double(timing.frame + timing.duration) * secondsPerFrame
+            let text = piece.replacingOccurrences(of: "▁", with: "")
+            if piece.hasPrefix("▁") || words.isEmpty {
+                // a bare `▁` still opens a word: HF splits "Nemotron 3" as "▁Nemotron", "▁", "3"
+                words.append(TimedWord(text: text, start: start, end: end))
+                continue
+            }
+            let last = words.count - 1
+            // punctuation takes the previous token's end, as HF's TDT timestamp refinement does
+            let isPunctuation = text.allSatisfy { $0.isPunctuation || $0.isSymbol }
+            words[last] = TimedWord(
+                text: words[last].text + text, start: words[last].start,
+                end: isPunctuation ? words[last].end : max(words[last].end, end))
+        }
+        return words.filter { !$0.text.isEmpty }
     }
 
     // MARK: - Parity Testing
@@ -491,25 +633,28 @@ public actor SpeechRecognitionModel {
     }
 
     /// Decodes exactly one encoder window. Long-form splitting happens in
-    /// ``transcribe(pcm:overlapSeconds:language:resetAfterSilenceFrames:)``, which needs detokenized text
-    /// to match the seams and so cannot stitch at this level.
+    /// ``decodeWindows(pcm:overlapSeconds:language:task:resetAfterSilenceFrames:timesWords:onPartial:)``,
+    /// which needs detokenized text or word times to join the seams and so cannot do it at this level.
+    /// - Parameter capturesAlignment: keep Whisper's alignment-head scores in `stats.alignment`,
+    ///   to time its words. Parakeet's token timings are always kept.
     private func decodeAudio(
         pcm: [Float], resources: DecoderResources? = nil, resetAfterSilenceFrames: Int = 0,
-        reporter: SpeechTokenReporter? = nil
+        reporter: SpeechTokenReporter? = nil, capturesAlignment: Bool = false
     ) async throws -> ([Int32], DecodeStats) {
         let (encOut, encShape, validEnc, encoderTiming) = try await runEncoderTimed(pcm: pcm)
         var (tokens, stats) = try await decodeEncoded(
             encOut: encOut, encShape: encShape, validEnc: validEnc, resources: resources,
-            resetAfterSilenceFrames: resetAfterSilenceFrames, reporter: reporter)
+            resetAfterSilenceFrames: resetAfterSilenceFrames, reporter: reporter,
+            capturesAlignment: capturesAlignment)
         stats.timing.preprocessMs = encoderTiming.preprocessMs
         stats.timing.encodeMs = encoderTiming.encodeMs
         return (tokens, stats)
     }
 
-    /// The decoder half of ``decodeAudio(pcm:resources:resetAfterSilenceFrames:reporter:)``.
+    /// The decoder half of ``decodeAudio(pcm:resources:resetAfterSilenceFrames:reporter:capturesAlignment:)``.
     private func decodeEncoded(
         encOut: NDArray, encShape: [Int], validEnc: Int, resources: DecoderResources?,
-        resetAfterSilenceFrames: Int, reporter: SpeechTokenReporter?
+        resetAfterSilenceFrames: Int, reporter: SpeechTokenReporter?, capturesAlignment: Bool
     ) async throws -> ([Int32], DecodeStats) {
         let effectiveResources = resources ?? self.resources
         // Not on `SpeechDecoder`, so reached by downcast the way `startStream` does. Thrown
@@ -538,13 +683,19 @@ public actor SpeechRecognitionModel {
                 resetAfterSilenceFrames: resetAfterSilenceFrames,
                 onToken: onToken, onProgress: onProgress)
         }
-        if let reporter, let whisper = decoder as? WhisperDecoder {
+        if reporter != nil || capturesAlignment, let whisper = decoder as? WhisperDecoder {
+            let onToken: (@Sendable (Int32) async throws -> Void)?
+            if let reporter {
+                onToken = { token in try await reporter.append(token) }
+            } else {
+                onToken = nil
+            }
             return try await whisper.decode(
                 encoderOutput: encOut,
                 encoderOutputShape: encShape,
                 validEncoderFrames: validEnc,
                 resources: effectiveResources,
-                onToken: { token in try await reporter.append(token) })
+                onToken: onToken, capturesAlignment: capturesAlignment)
         }
         return try await decoder.decode(
             encoderOutput: encOut,

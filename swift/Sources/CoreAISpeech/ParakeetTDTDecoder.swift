@@ -244,6 +244,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             }
 
             var emitted: [Int32] = []
+            var timings: [DecodeStats.TokenTiming] = []
             // Resume where the last chunk's duration jump landed, then clear the debt.
             var frame = frames.lowerBound + timeJump
             timeJump = 0
@@ -317,6 +318,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
 
                     if !isBlank {
                         emitted.append(symbol)
+                        timings.append(DecodeStats.TokenTiming(token: symbol, frame: frame, duration: dur))
                         try await onToken?(symbol)
                     }
                     // Carries blanks too, matching HF. Holding the last non-blank instead would
@@ -393,7 +395,7 @@ public struct ParakeetTDTDecoder: SpeechDecoder {
             return (
                 tokens: emitted,
                 stats: DecodeStats(
-                    stepTimesMs: stepTimesMs, coverage: coverage, firstStep: capture)
+                    stepTimesMs: stepTimesMs, coverage: coverage, firstStep: capture, tokenTimings: timings)
             )
         }
 

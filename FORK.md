@@ -34,8 +34,53 @@ Two things to know before rebasing:
   own Whisper KV export, the two encoders will not be interchangeable.
 - The export depends on runtime behaviour that upstream does not document: the KV
   state arrives uninitialized, and the forced prefix's last token is fed twice.
+- Since 2026-10-19 the decoder has a second output, `alignment_logits`: the
+  pre-softmax cross-attention scores of the model's `generation_config.alignment_heads`,
+  which word timestamps are aligned from (see
+  [Whisper word timestamps](#whisper-word-timestamps)). Bundles exported before that
+  still transcribe; they cannot time words. `metadata.json` lists the heads.
 
 Full detail in [`models/whisper/README_KV.md`](models/whisper/README_KV.md).
+
+---
+
+## Nemotron-3-Diarization export
+
+**Added:** `models/nemotron3-diarization/` — `export.py`, `verify.py` and `README.md`
+
+New model family, not upstream: NVIDIA's streaming speaker diarization, exported as one static-shape encoder step
+per latency mode, with the streaming loop and speaker-cache policy left on the host. `verify.py` drives the
+exported step with HF's own cache class and compares whole sessions against the HF model.
+
+Touches nothing shared, so it rebases cleanly. Two things in it are about the toolchain rather than the model,
+and may be worth raising upstream:
+
+- On iOS 27.2 a compiled asset holding several functions duplicates the weights per function (740 MB for four
+  190 MB functions) and failed to specialize on an iPhone 15 Pro; single-function assets work. Hence `--split`.
+- HF's eager attention (separate matmuls, float32 softmax) allocated 600-900 MB per step on device; exporting with
+  `attn_implementation="sdpa"` keeps it flat. Other recipes exporting HF attention on iOS may hit the same.
+
+Full detail in [`models/nemotron3-diarization/README.md`](models/nemotron3-diarization/README.md).
+
+**Swift:** a new `CoreAIDiarization` target and product (the diarizer, the speaker-cache port and speaker-turn
+segmentation), the `diarization` CLI and `DiarizationTests`. Three additive changes in `CoreAISpeech`, none altering
+existing behaviour:
+
+- `DecodeStats.tokenTimings` — the Parakeet TDT loop records each emitted token's frame and duration
+  (`ParakeetTDTDecoder.Stream.decodeFrames`). Empty after `DecodeStats.merged`.
+- `SpeechRecognitionModel.transcribeWords(pcm:overlapSeconds:language:task:resetAfterSilenceFrames:onPartial:)` and
+  `TimedWord` — words with times, windows seamed by time. Parakeet at first; Whisper since
+  [Whisper word timestamps](#whisper-word-timestamps). It takes `transcribe`'s parameters, and `onPartial` gets the
+  same untimed snapshots, because both are thin wrappers over one private window loop, `decodeWindows`: same
+  windows, language resolved once, same reporter, text stitched by words and words seamed by time. A rebase that
+  changes `transcribe`'s body lands there.
+- `MelConfig.Normalization.none` and `MelConfig.nemotronDiarization`.
+
+**Parakeet on iOS** (found while timing it beside the diarizer on an iPhone 15 Pro, iOS 27.2; affects upstream's Parakeet bundles,
+which had only been run on Mac): compiled the default way, the encoder and decoder step crash the Neural Engine
+compiler service on every load (`failedToSpecialize`). Compiling them with `coreai-build --preferred-compute gpu`
+and loading with `SpeechComputeUnits.unspecialized` works — which `scripts/compile_bundle.sh` already defaults to.
+The decode-on-CPU default (`SpeechComputeUnits.default`) has no compiled CPU path to use there.
 
 ---
 
@@ -81,6 +126,16 @@ work around it:
 
 ```sh
 swift build --build-tests
+xcrun xctest .build/out/Products/Debug/SpeechTests.xctest
+```
+
+As of 2026-10-19 that is no longer enough: on the current Xcode beta
+`CoreAILanguageModel.swift:64` fails to *compile* with the same drift (`extraneous
+argument label 'capabilities:'`), so `swift build --build-tests` stops there. The
+speech tests still build and run on their own:
+
+```sh
+swift build --target SpeechTests && swift build --product SpeechTests
 xcrun xctest .build/out/Products/Debug/SpeechTests.xctest
 ```
 
@@ -545,6 +600,54 @@ conflict — worth knowing about for the next one:
   estimate rounded to nearest, to an exact per-stage stride-2 derivation. Whisper is
   unaffected (`WhisperDecoder` documents that it ignores the value and stops on EOT);
   Parakeet's last partial window now gets an exact cap instead of a rounded one.
+
+---
+
+### Whisper word timestamps
+
+**Added:** `swift/Sources/CoreAISpeech/WhisperAlignment.swift`,
+`swift/Tests/SpeechTests/WhisperAlignmentTests.swift`
+**Changed:** `WhisperDecoder.decode(…, onToken:capturesAlignment:)`,
+`DecodeStats.alignment` (package), `SpeechRecognitionModel.transcribeWords`, and in
+`models/whisper/`: `export_kv.py` (the `alignment_logits` output) and `verify_kv.py`
+(a fourth check, word alignment)
+
+`transcribeWords` used to be Parakeet only, because Whisper decodes with
+`<|notimestamps|>` and its tokens carry no frame. It now times Whisper's words the way
+openai-whisper's `word_timestamps` and HF's `return_token_timestamps` do: the decoder
+step also returns its alignment heads' cross-attention scores, one row per generated
+token (eot included, since eot is what ends the last word), and `WhisperAlignment` takes
+the softmax over the frames real audio backs, normalizes each head's frame across
+tokens, median-filters (width 7), averages the heads and warps tokens onto frames
+(DTW). Tokens group into words by openai-whisper's rules: subwords join, punctuation
+joins its neighbour and takes no time, a long word at a sentence end is truncated, and
+a first word stretched over leading silence is clamped. Long audio uses the same
+midpoint seam as Parakeet; Whisper's language is resolved once, on the first window.
+
+The scores come out of the graph rather than being recomputed on the host: the fused
+SDPA returns no weights, and the decoder's query is internal, so the export computes
+`q · kᵀ / √d` for just those heads beside the SDPA (six `[1, 64] × [64, 1500]` products
+on turbo, negligible next to the step). They are left unnormalized so the host can
+crop before the softmax, as openai-whisper does.
+
+Measured on `whisper-large-v3-turbo-kv_float16`, M5 Pro, decoder on CPU:
+
+| Clip | Alignment weights vs HF fp32 eager | Token start frames identical | Max word time shift |
+| --- | ---: | ---: | ---: |
+| `jfk.wav` (11 s) | 71.1 dB | 27/27 | 0 ms |
+| `diarization_example.wav`, first 30 s | 63.7 dB | 124/128 | 80 ms |
+
+All six published bundles were re-exported with the output on 2026-10-19 (turbo,
+medium and large-v3, each dynamic and `--static-positions`). On `jfk.wav` each one
+passes token parity and the NaN-cache check, and its 22 words match HF's within one
+frame: alignment weights 70.7-78.0 dB, at most one token start frame off (20 ms).
+Static and dynamic bundles give identical words through the Swift.
+
+Token parity, the NaN-cache check and the prefix-step logits are unchanged by the
+extra output (24.8 dB on `jfk.wav` before and after). The alignment adds 66 ms to a
+97.6 s, four-window `transcribeWords` in a release build. The Swift is
+pinned to the Python reference by unit tests; that reference uses HF's own
+`_median_filter` and `_dynamic_time_warping`.
 
 ---
 

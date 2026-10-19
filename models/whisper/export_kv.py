@@ -14,7 +14,9 @@ encoder for every generated token), this writes the encoder/decoder bundle that
   (``n_mels`` is 128 for large-v3/turbo, 80 for medium)
 * ``decoder.aimodel`` — one decoder token per call, with the self-attention KV
   cache carried as Core AI **state** (``keyCache`` / ``valueCache``) and updated
-  in place between calls.
+  in place between calls. Besides ``logits`` it returns ``alignment_logits``,
+  the cross-attention scores of the model's alignment heads, which is what word
+  timestamps are aligned from.
 
 ``encoder_hidden_states`` does not hold hidden states. The Swift decode loop
 passes it as a plain input on every step and has no cross-attention cache, so a
@@ -137,8 +139,14 @@ class WhisperDecoderStep(torch.nn.Module):
     State:
         k_cache / v_cache     [n_layers, 1, n_heads, 448, head_dim], exported as
                               ``keyCache`` / ``valueCache``
-    Output:
-        logits [1, 1, vocab]
+    Outputs:
+        logits           [1, 1, vocab]
+        alignment_logits [1, n_alignment_heads, 1500] — pre-softmax cross-attention
+                         scores of ``generation_config.alignment_heads``, in that
+                         order. Word timestamps are aligned from these (dynamic time
+                         warping, as HF ``return_token_timestamps`` and openai-whisper
+                         ``word_timestamps`` do); they are left unnormalized so the
+                         host can take the softmax over the valid frames only.
     """
 
     def __init__(self, hf: torch.nn.Module) -> None:
@@ -158,6 +166,22 @@ class WhisperDecoderStep(torch.nn.Module):
         # `scale=None` resolves to head_dim**-0.5, matching WhisperAttention.
         self.self_sdpa = SDPA()
         self.cross_sdpa = SDPA()
+        # The fused SDPA returns no attention weights, so the alignment heads' scores are
+        # recomputed beside it: a [1, 64] x [64, 1500] product per head, negligible next
+        # to the step. Grouped by layer, in the generation config's (layer, head) order.
+        heads = getattr(hf.generation_config, "alignment_heads", None)
+        if not heads:
+            raise ValueError(f"{cfg.name_or_path} has no alignment_heads in its generation config")
+        self.alignment_heads = [tuple(pair) for pair in heads]
+
+    def _alignment_logits(self, i, q, ck):
+        """Layer ``i``'s alignment heads' cross-attention scores, one ``[1, 1, query_len, src]`` each."""
+        return [
+            torch.matmul(q.narrow(1, head, 1), ck.narrow(1, head, 1).transpose(-1, -2))
+            * self.head_dim**-0.5
+            for layer, head in self.alignment_heads
+            if layer == i
+        ]
 
     def _heads(self, x, length):
         """[1, length, d_model] -> [1, n_heads, length, head_dim]."""
@@ -173,6 +197,7 @@ class WhisperDecoderStep(torch.nn.Module):
         torch._check_is_size(offset)
 
         cache = KVCache(k_cache, v_cache)
+        alignment = []
 
         h = self.embed_tokens(input_ids)
         pos = position_ids.narrow(-1, offset, query_len).reshape(-1)
@@ -205,13 +230,16 @@ class WhisperDecoderStep(torch.nn.Module):
             cv = self._heads(encoder_hidden_states.narrow(2, base + d, d), src)
             a = self.cross_sdpa(q, ck, cv).transpose(1, 2).reshape(1, query_len, d)
             h = residual + ca.out_proj(a)
+            alignment += self._alignment_logits(i, q, ck)
 
             # --- feed-forward ---
             residual = h
             x = layer.final_layer_norm(h)
             h = residual + layer.fc2(layer.activation_fn(layer.fc1(x)))
 
-        return self.proj_out(self.layer_norm(h))
+        src = encoder_hidden_states.shape[1]
+        alignment = torch.cat(alignment, dim=1).reshape(1, len(self.alignment_heads), src)
+        return self.proj_out(self.layer_norm(h)), alignment
 
 
 class WhisperDecoderStepStatic(WhisperDecoderStep):
@@ -249,6 +277,7 @@ class WhisperDecoderStepStatic(WhisperDecoderStep):
             valid.reshape(1, 1, 1, max_tgt), zero, torch.finfo(h.dtype).min
         ).to(h.dtype)
         zero_i = torch.zeros(1, dtype=torch.int32)
+        alignment = []
 
         def update(cache, i, x):
             layer = torch.tensor([i], dtype=torch.int32)
@@ -294,13 +323,16 @@ class WhisperDecoderStepStatic(WhisperDecoderStep):
             cv = self._heads(encoder_hidden_states.narrow(2, base + d, d), src)
             a = self.cross_sdpa(q, ck, cv).transpose(1, 2).reshape(1, 1, d)
             h = residual + ca.out_proj(a)
+            alignment += self._alignment_logits(i, q, ck)
 
             # --- feed-forward ---
             residual = h
             x = layer.final_layer_norm(h)
             h = residual + layer.fc2(layer.activation_fn(layer.fc1(x)))
 
-        return self.proj_out(self.layer_norm(h))
+        src = encoder_hidden_states.shape[1]
+        alignment = torch.cat(alignment, dim=1).reshape(1, len(self.alignment_heads), src)
+        return self.proj_out(self.layer_norm(h)), alignment
 
 
 def _metadata(model_name: str, component: str) -> AIModelAssetMetadata:
@@ -328,7 +360,7 @@ def _prepare_bundle_dir(bundle_dir: Path, overwrite: bool) -> None:
 
 
 def _write_bundle_metadata(
-    bundle_dir: Path, variant: str, cfg, dtype: torch.dtype
+    bundle_dir: Path, variant: str, cfg, dtype: torch.dtype, alignment_heads
 ) -> None:
     metadata = {
         "metadata_version": "0.2",
@@ -349,6 +381,8 @@ def _write_bundle_metadata(
             # Flags the deviation documented in README_KV.md: the tensor named
             # `encoder_hidden_states` carries packed per-layer cross K/V.
             "cross_kv_packed": True,
+            # The (layer, head) pairs behind the decoder's `alignment_logits`, in order.
+            "alignment_heads": alignment_heads,
         },
     }
     (bundle_dir / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n")
@@ -478,7 +512,7 @@ def create_whisper_kv(
         reference_inputs=reference_inputs,
         dynamic_shapes=dynamic_shapes,
         input_names=("input_ids", "position_ids", "encoder_hidden_states"),
-        output_names=("logits",),
+        output_names=("logits", "alignment_logits"),
         state_names=(KEY_CACHE_NAME, VALUE_CACHE_NAME),
     )
     dec_program.optimize()
@@ -488,7 +522,9 @@ def create_whisper_kv(
     print("[INFO] Decoder saved.")
 
     # --- Sidecars ---
-    _write_bundle_metadata(bundle_dir, variant, cfg, dtype)
+    _write_bundle_metadata(
+        bundle_dir, variant, cfg, dtype, [list(pair) for pair in decoder.alignment_heads]
+    )
     _write_generation_config(bundle_dir, model_name, cfg, forced_decoder_ids)
     # swift-transformers needs tokenizer.json *and* tokenizer_config.json in the
     # bundle root; if the local load fails it does not fall back to the HF cache.

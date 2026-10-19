@@ -40,6 +40,10 @@ let package = Package(
             targets: ["CoreAISpeech"]
         ),
         .library(
+            name: "CoreAIDiarization",
+            targets: ["CoreAIDiarization"]
+        ),
+        .library(
             name: "CoreAIObjectDetection",
             targets: [
                 "CoreAIObjectDetector"
@@ -249,6 +253,27 @@ let package = Package(
                 .enableUpcomingFeature("MemberImportVisibility")
             ]
         ),
+        // Speaker diarization (Nemotron-3-Diarization)
+        .target(
+            name: "CoreAIDiarization",
+            dependencies: ["CoreAISpeech", "CoreAIShared"],
+            path: "swift/Sources/CoreAIDiarization",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
+        .executableTarget(
+            name: "diarization",
+            dependencies: [
+                "CoreAIDiarization",
+                "CoreAISpeech",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+            ],
+            path: "swift/Sources/Tools/diarization",
+            swiftSettings: [
+                .enableUpcomingFeature("MemberImportVisibility")
+            ]
+        ),
         .executableTarget(
             name: "speech-recognizer",
             dependencies: [
@@ -356,6 +381,11 @@ let package = Package(
                 "TestUtilities",
             ],
             path: "swift/Tests/SpeechTests"
+        ),
+        .testTarget(
+            name: "DiarizationTests",
+            dependencies: ["CoreAIDiarization"],
+            path: "swift/Tests/DiarizationTests"
         ),
     ],
     swiftLanguageModes: [.v6],
