@@ -28,6 +28,26 @@ public struct SpeakerActivity: Sendable {
 }
 
 /// What a diarization run cost, for benchmarking.
+/// One step's worth of a diarization in progress: the speaker activity of the frames it settled, which
+/// follow the frames of every update before it. Concatenated, the updates are exactly the activity
+/// ``Diarizer/diarize(pcm:onUpdate:)`` returns: a frame is never revised once reported.
+public struct DiarizationUpdate: Sendable {
+    /// The new frames' activity.
+    public let activity: SpeakerActivity
+    /// The index of its first frame in the whole recording's activity.
+    public let startFrame: Int
+
+    public init(activity: SpeakerActivity, startFrame: Int) {
+        self.activity = activity
+        self.startFrame = startFrame
+    }
+
+    /// The frames reported so far, this update's included.
+    public var endFrame: Int { startFrame + activity.numFrames }
+    /// How far into the audio the reported frames reach, in seconds.
+    public var endSeconds: Double { Double(endFrame) * activity.frameSeconds }
+}
+
 public struct DiarizationTiming: Sendable, Codable {
     public var featuresMs: Double = 0
     /// Core AI step runs.
@@ -172,7 +192,14 @@ public actor Diarizer {
     /// `offline` this is exactly the HF forward; for a streaming mode it replays the HF
     /// streaming loop over full-pass features, which the HF processor reproduces frame for
     /// frame, so the steps, cache and outputs are what a live session would compute.
-    public func diarize(pcm: [Float]) async throws -> (activity: SpeakerActivity, timing: DiarizationTiming) {
+    ///
+    /// - Parameter onUpdate: receives each step's frames as soon as the step settles them, in order,
+    ///   for a caller that shows speakers as they are found. A chunk's frames are final once its step
+    ///   has run, so nothing reported is revised. One step covers the mode's chunk: 30 s offline, about
+    ///   1 s at low latency.
+    public func diarize(
+        pcm: [Float], onUpdate: (@Sendable (DiarizationUpdate) -> Void)? = nil
+    ) async throws -> (activity: SpeakerActivity, timing: DiarizationTiming) {
         var timing = DiarizationTiming()
         let clock = ContinuousClock()
         var mark = clock.now
@@ -198,6 +225,8 @@ public actor Diarizer {
         let windowChunk = geometry.chunkFrames + geometry.lookaheadFrames
         var output = [Float]()
         output.reserveCapacity(totalMelFrames * numSpeakers)
+        let frameSeconds = Double(config.hopLength) / config.sampleRate
+        var reportedFrames = 0
 
         for (start, numChunkFrames, numLookahead) in chunks(numEmbeds: numEmbeds) {
             // a streaming mode takes thousands of steps over a long meeting
@@ -242,14 +271,28 @@ public actor Diarizer {
             let first = numCached * subsampling
             let last = min((numCached + numChunkFrames) * subsampling, first + (melEnd - melStart))
             output += stepLogits[(first * numSpeakers)..<(last * numSpeakers)]
+            if let onUpdate {
+                // the same frames, and the same sigmoid, as the activity returned at the end
+                let settled = min(output.count / numSpeakers, totalMelFrames)
+                if settled > reportedFrames {
+                    let probabilities = output[(reportedFrames * numSpeakers)..<(settled * numSpeakers)]
+                        .map { 1 / (1 + exp(-$0)) }
+                    onUpdate(
+                        DiarizationUpdate(
+                            activity: SpeakerActivity(
+                                probabilities: probabilities, numFrames: settled - reportedFrames,
+                                numSpeakers: numSpeakers, frameSeconds: frameSeconds),
+                            startFrame: reportedFrames))
+                    reportedFrames = settled
+                }
+            }
             timing.hostMs += (clock.now - mark).milliseconds
         }
 
         let numFrames = min(output.count / numSpeakers, totalMelFrames)
         let probabilities = output.prefix(numFrames * numSpeakers).map { 1 / (1 + exp(-$0)) }
         let activity = SpeakerActivity(
-            probabilities: probabilities, numFrames: numFrames, numSpeakers: numSpeakers,
-            frameSeconds: Double(config.hopLength) / config.sampleRate)
+            probabilities: probabilities, numFrames: numFrames, numSpeakers: numSpeakers, frameSeconds: frameSeconds)
         return (activity, timing)
     }
 

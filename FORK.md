@@ -63,7 +63,11 @@ and may be worth raising upstream:
 Full detail in [`models/nemotron3-diarization/README.md`](models/nemotron3-diarization/README.md).
 
 **Swift:** a new `CoreAIDiarization` target and product (the diarizer, the speaker-cache port and speaker-turn
-segmentation), the `diarization` CLI and `DiarizationTests`. Three additive changes in `CoreAISpeech`, none altering
+segmentation), the `diarization` CLI and `DiarizationTests`. `Diarizer.diarize(pcm:onUpdate:)` reports each step's
+frames as it settles them (`DiarizationUpdate`), for a caller that shows speakers as they are found: a chunk's output
+is final once its step has run, so the updates concatenated are exactly the activity returned (`DiarizationUpdateTests`,
+which run when `exports/` holds the `--split` bundle and `harness-audio/diarization_example.wav`). One update per
+step: four for the 97.6 s example offline, about one a second at low latency. Three additive changes in `CoreAISpeech`, none altering
 existing behaviour:
 
 - `DecodeStats.tokenTimings` — the Parakeet TDT loop records each emitted token's frame and duration

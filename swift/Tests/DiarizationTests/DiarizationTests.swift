@@ -3,6 +3,9 @@
 // Use of this source code is governed by a BSD-3-clause license that can
 // be found in the LICENSE file or at https://opensource.org/licenses/BSD-3-Clause
 
+import AVFoundation
+import Foundation
+import Synchronization
 import Testing
 
 @testable import CoreAIDiarization
@@ -81,5 +84,47 @@ struct SpeakerCacheTests {
         // two silence slots (one per speaker), whose embedding is all -1
         let rows = stride(from: 0, to: cache.cacheEmbeds.count, by: 2).map { cache.cacheEmbeds[$0] }
         #expect(rows.filter { $0 == -1 }.count == 2)
+    }
+}
+
+/// The `--split` bundle and NVIDIA's example clip, where the fork keeps its exports (`exports/`, ignored by
+/// git). Absent, the suite is skipped.
+private enum Exported {
+    static let directory = URL(filePath: #filePath).deletingLastPathComponent()
+        .appending(path: "../../../exports", directoryHint: .isDirectory).standardizedFileURL
+    static let bundle = directory.appending(path: "nemotron-3-diarization_float16_split", directoryHint: .isDirectory)
+    static let example = directory.appending(path: "harness-audio/diarization_example.wav")
+    static var isPresent: Bool {
+        FileManager.default.fileExists(atPath: bundle.path(percentEncoded: false))
+            && FileManager.default.fileExists(atPath: example.path(percentEncoded: false))
+    }
+
+    /// The example's samples, already 16 kHz mono.
+    static func pcm() throws -> [Float] {
+        let file = try AVAudioFile(forReading: example, commonFormat: .pcmFormatFloat32, interleaved: false)
+        let buffer = try #require(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)))
+        try file.read(into: buffer)
+        let channel = try #require(buffer.floatChannelData?[0])
+        return Array(UnsafeBufferPointer(start: channel, count: Int(buffer.frameLength)))
+    }
+}
+
+@Suite("Diarizing as it goes", .enabled(if: Exported.isPresent), .serialized)
+struct DiarizationUpdateTests {
+    @Test("Each step's frames, in order, make up the activity returned", arguments: ["offline", "low_latency"])
+    func updatesMakeUpTheActivity(mode: String) async throws {
+        let diarizer = try await Diarizer(bundleAt: Exported.bundle, mode: mode)
+        let updates = Mutex<[DiarizationUpdate]>([])
+        let (activity, timing) = try await diarizer.diarize(pcm: Exported.pcm()) { update in
+            updates.withLock { $0.append(update) }
+        }
+        let reported = updates.withLock { $0 }
+
+        #expect(!reported.isEmpty && reported.count <= timing.steps)
+        #expect(reported.map(\.startFrame) == [0] + reported.dropLast().map(\.endFrame))
+        #expect(reported.last?.endFrame == activity.numFrames)
+        #expect(reported.flatMap(\.activity.probabilities) == activity.probabilities)
+        // Offline steps cover 30 s each, so the 97.6 s example takes four; low latency about a second each.
+        if mode == "offline" { #expect(reported.count == 4) } else { #expect(reported.count > 80) }
     }
 }
