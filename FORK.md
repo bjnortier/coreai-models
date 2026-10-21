@@ -11,6 +11,8 @@ Upstream's **Live Transcription with Parakeet v3** (`684ae8e`, #184) landed in t
 range and is the only upstream change that touches this fork's work. See
 [Relationship to upstream streaming](#relationship-to-upstream-streaming) below.
 
+`AGENTS.md` and `CLAUDE.md` (which imports it) are the fork's own instructions for coding agents, not upstream.
+
 ---
 
 ## Whisper KV-cache export
