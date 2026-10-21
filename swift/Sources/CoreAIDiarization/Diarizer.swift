@@ -87,6 +87,8 @@ public enum DiarizationError: LocalizedError {
     case noStepToRepeat
     /// A loading step failed; `stage` says which, since some framework errors carry no detail of their own.
     case loadFailed(stage: String, underlying: Error)
+    /// ``Diarizer/stream(pcm:)`` or ``Diarizer/finishStream()`` without ``Diarizer/startStream(onUpdate:)``.
+    case notStreaming
 
     public var errorDescription: String? {
         switch self {
@@ -94,6 +96,7 @@ public enum DiarizationError: LocalizedError {
         case .noLoadableAsset(let mode, let error): "No asset for '\(mode)' loaded: \(error.map { "\($0)" } ?? "none found")"
         case .missingFunction(let name): "The step asset is missing '\(name)'."
         case .noStepToRepeat: "No step has run yet, so there is none to repeat."
+        case .notStreaming: "No stream has been started."
         case .loadFailed(let stage, let error):
             "Loading the diarizer failed at \(stage): \(error) (\((error as NSError).domain) \((error as NSError).code))"
         }
@@ -112,6 +115,10 @@ public actor Diarizer {
     private let step: StepFunction
     private let silenceEmbeds: [Float]
     private let melBasis: MelSpectrogram.Basis
+    /// The stream being diarized, between ``startStream(onUpdate:)`` and ``finishStream()``.
+    private var streamState: StreamState?
+    /// A ``stream(pcm:)`` is running steps; another call only adds its samples for it to take.
+    private var isPumping = false
 
     /// Loads one mode of the bundle at `url`.
     ///
@@ -212,88 +219,267 @@ public actor Diarizer {
         timing.featuresMs = (clock.now - mark).milliseconds
 
         let subsampling = metadata.subsamplingFactor
-        let hidden = metadata.hiddenSize
         let numSpeakers = metadata.numSpeakers
         let numEmbeds = (totalMelFrames + subsampling - 1) / subsampling
         // an encoder frame is valid when the first mel frame it stacks is
         let embedValid = (0..<numEmbeds).map { $0 * subsampling < validMelFrames }
 
-        var cache = SpeakerCache(
-            policy: metadata.speakerCache, fifoLength: geometry.fifoLength,
-            updatePeriod: geometry.speakerCacheUpdatePeriod, numSpeakers: numSpeakers, hiddenSize: hidden,
-            subsampling: subsampling)
-        let windowChunk = geometry.chunkFrames + geometry.lookaheadFrames
+        var cache = makeCache()
         var output = [Float]()
         output.reserveCapacity(totalMelFrames * numSpeakers)
-        let frameSeconds = Double(config.hopLength) / config.sampleRate
         var reportedFrames = 0
 
         for (start, numChunkFrames, numLookahead) in chunks(numEmbeds: numEmbeds) {
             // a streaming mode takes thousands of steps over a long meeting
             try Task.checkCancellation()
-            let numStepEmbeds = numChunkFrames + numLookahead
+            output += try await runStep(
+                start: start, numChunkFrames: numChunkFrames, numLookahead: numLookahead, features: features,
+                featureBase: 0, totalMelFrames: totalMelFrames, isValid: { embedValid[$0] }, cache: &cache,
+                timing: &timing)
             mark = clock.now
-            let cached = cache.cachedEmbeds
-            let numCached = cache.numCachedFrames
-
-            // left-pad the cache, right-pad the chunk; see export.py for why left
-            var cachedInput = [Float](repeating: 0, count: geometry.cacheFrames * hidden)
-            cachedInput.replaceSubrange(((geometry.cacheFrames - numCached) * hidden)..., with: cached)
-            var chunkInput = [Float](repeating: 0, count: windowChunk * subsampling * numMelBins)
-            let melStart = start * subsampling
-            let melEnd = min((start + numStepEmbeds) * subsampling, totalMelFrames)
-            chunkInput.replaceSubrange(
-                0..<((melEnd - melStart) * numMelBins),
-                with: features[(melStart * numMelBins)..<(melEnd * numMelBins)])
-            var keyMask = [Float](repeating: 0, count: geometry.cacheFrames + windowChunk)
-            for i in (geometry.cacheFrames - numCached)..<geometry.cacheFrames { keyMask[i] = 1 }
-            let chunkValid = Array(embedValid[start..<(start + numStepEmbeds)])
-            for (i, valid) in chunkValid.enumerated() where valid { keyMask[geometry.cacheFrames + i] = 1 }
-            timing.hostMs += (clock.now - mark).milliseconds
-
-            mark = clock.now
-            try await step.run(cachedEmbeds: cachedInput, chunkFeatures: chunkInput, keyMask: keyMask)
-            timing.stepsMs += (clock.now - mark).milliseconds
-            timing.steps += 1
-
-            mark = clock.now
-            let (logits, chunkEmbeds) = step.readOutputs()
-            // drop the cache's left padding and the chunk's right padding
-            let offset = geometry.cacheFrames - numCached
-            let stepLogits = Array(
-                logits[(offset * subsampling * numSpeakers)..<((geometry.cacheFrames + numStepEmbeds) * subsampling * numSpeakers)])
-            let inputEmbeds = cached + chunkEmbeds[0..<(numStepEmbeds * hidden)]
-            cache.update(
-                inputEmbeds: inputEmbeds, logits: stepLogits, silenceEmbeds: silenceEmbeds,
-                numChunkFrames: numChunkFrames,
-                mask: [Bool](repeating: true, count: numCached) + chunkValid)
-
-            let first = numCached * subsampling
-            let last = min((numCached + numChunkFrames) * subsampling, first + (melEnd - melStart))
-            output += stepLogits[(first * numSpeakers)..<(last * numSpeakers)]
             if let onUpdate {
-                // the same frames, and the same sigmoid, as the activity returned at the end
-                let settled = min(output.count / numSpeakers, totalMelFrames)
-                if settled > reportedFrames {
-                    let probabilities = output[(reportedFrames * numSpeakers)..<(settled * numSpeakers)]
-                        .map { 1 / (1 + exp(-$0)) }
-                    onUpdate(
-                        DiarizationUpdate(
-                            activity: SpeakerActivity(
-                                probabilities: probabilities, numFrames: settled - reportedFrames,
-                                numSpeakers: numSpeakers, frameSeconds: frameSeconds),
-                            startFrame: reportedFrames))
-                    reportedFrames = settled
-                }
+                report(output, upTo: min(output.count / numSpeakers, totalMelFrames), reported: &reportedFrames, to: onUpdate)
             }
             timing.hostMs += (clock.now - mark).milliseconds
         }
+        return (activity(output, numFrames: min(output.count / numSpeakers, totalMelFrames)), timing)
+    }
 
-        let numFrames = min(output.count / numSpeakers, totalMelFrames)
+    // MARK: - Streaming
+
+    /// Starts diarizing audio as it arrives, as a live session does: hand it to ``stream(pcm:)`` as it is
+    /// recorded, then call ``finishStream()``. Any stream already going is dropped.
+    ///
+    /// The steps, cache and outputs are exactly those ``diarize(pcm:onUpdate:)`` computes for the whole
+    /// recording: a step runs as soon as its chunk and look-ahead are final. Nemotron's mel features are
+    /// not normalized, and a frame reads only the 200 samples either side of its centre, so a frame is final
+    /// once the audio reaches 200 samples past it. At low latency a step then waits for its 1.04 s of audio
+    /// and about 13 ms more. Each step's frames go to `onUpdate`, as ``diarize(pcm:onUpdate:)`` reports them.
+    public func startStream(onUpdate: (@Sendable (DiarizationUpdate) -> Void)? = nil) {
+        streamState = StreamState(cache: makeCache(), onUpdate: onUpdate)
+    }
+
+    /// Adds 16 kHz mono samples to the stream and runs every step they complete. A call made while another
+    /// is still running steps adds its samples for that one to take. Throws
+    /// ``DiarizationError/notStreaming`` without ``startStream(onUpdate:)``.
+    public func stream(pcm: [Float]) async throws {
+        guard streamState != nil else { throw DiarizationError.notStreaming }
+        streamState?.pcm += pcm
+        streamState?.sampleCount += pcm.count
+        guard !isPumping else { return }
+        isPumping = true
+        defer { isPumping = false }
+        try await pump(finishing: false)
+    }
+
+    /// Runs the stream's last steps over what remains, as the end of a whole recording is run, and returns
+    /// its whole activity: exactly what ``diarize(pcm:onUpdate:)`` returns for the same samples.
+    public func finishStream() async throws -> (activity: SpeakerActivity, timing: DiarizationTiming) {
+        guard streamState != nil else { throw DiarizationError.notStreaming }
+        while isPumping { await Task.yield() }
+        isPumping = true
+        defer {
+            isPumping = false
+            streamState = nil
+        }
+        try await pump(finishing: true)
+        guard let state = streamState else { throw DiarizationError.notStreaming }
+        let totalMelFrames = state.sampleCount / MelConfig.nemotronDiarization.hopLength + 1
+        return (activity(state.output, numFrames: min(state.output.count / metadata.numSpeakers, totalMelFrames)), state.timing)
+    }
+
+    /// What a stream has received and computed. Samples and features older than the next step needs are
+    /// dropped, so a long session holds only its outputs, four floats per 10 ms.
+    private struct StreamState {
+        var cache: SpeakerCache
+        let onUpdate: (@Sendable (DiarizationUpdate) -> Void)?
+        /// Samples from `pcmBase`, of `sampleCount` received.
+        var pcm: [Float] = []
+        var pcmBase = 0
+        var sampleCount = 0
+        /// Final mel frames from `featureBase` to `featureEnd`, time-major.
+        var features: [Float] = []
+        var featureBase = 0
+        var featureEnd = 0
+        /// The next step's first encoder frame.
+        var nextStart = 0
+        var output: [Float] = []
+        var reportedFrames = 0
+        var timing = DiarizationTiming()
+    }
+
+    /// Computes the features the received samples make final, then runs every step they complete.
+    /// `finishing` treats the samples as the whole recording: its last frames, padded with zeros as
+    /// ``diarize(pcm:onUpdate:)`` pads them, and its last steps, as `chunks(numEmbeds:)` lays them out.
+    private func pump(finishing: Bool) async throws {
+        let config = MelConfig.nemotronDiarization
+        let hop = config.hopLength
+        // a frame reads from `lead` samples before its centre to `winLength - lead` after
+        let lead = config.nFFT / 2 - (config.nFFT - config.winLength) / 2
+        let subsampling = metadata.subsamplingFactor
+        let numMelBins = config.nMelBins
+        let numSpeakers = metadata.numSpeakers
+        let (chunk, lookahead) = (geometry.chunkFrames, geometry.lookaheadFrames)
+
+        while let state = streamState {
+            try Task.checkCancellation()
+            let clock = ContinuousClock()
+            let mark = clock.now
+            let validFrames = state.sampleCount / hop
+            let finalFrames =
+                finishing ? validFrames : min(validFrames, max(0, (state.sampleCount - (config.winLength - lead)) / hop + 1))
+            if finalFrames > state.featureEnd {
+                // from two frames before the first new one: the slice's own start pads them, and
+                // pre-emphasis has no sample before it
+                let sliceStart = max(0, (state.featureEnd - 2) * hop)
+                let slice = Array(state.pcm[(sliceStart - state.pcmBase)...])
+                let mel = MelSpectrogram.fromPCM(slice, config: config, basis: melBasis)
+                let firstFrame = sliceStart / hop
+                streamState?.features += mel[((state.featureEnd - firstFrame) * numMelBins)..<((finalFrames - firstFrame) * numMelBins)]
+                streamState?.featureEnd = finalFrames
+                let keep = max(0, (finalFrames - 2) * hop)
+                streamState?.pcm.removeFirst(keep - state.pcmBase)
+                streamState?.pcmBase = keep
+            }
+            if finishing {
+                // the trailing zero frame a whole recording's features end with
+                streamState?.features += [Float](repeating: 0, count: numMelBins)
+            }
+            streamState?.timing.featuresMs += (clock.now - mark).milliseconds
+            guard var state = streamState else { return }
+
+            let totalMelFrames = finishing ? validFrames + 1 : Int.max
+            let steps: [(Int, Int, Int)]
+            if finishing {
+                steps = chunks(numEmbeds: (validFrames + 1 + subsampling - 1) / subsampling).filter { $0.0 >= state.nextStart }
+            } else if (state.nextStart + chunk + lookahead) * subsampling <= state.featureEnd {
+                steps = [(state.nextStart, chunk, lookahead)]
+            } else {
+                return
+            }
+            for (start, numChunkFrames, numLookahead) in steps {
+                try Task.checkCancellation()
+                let valid = finishing ? validFrames : state.featureEnd
+                state.output += try await runStep(
+                    start: start, numChunkFrames: numChunkFrames, numLookahead: numLookahead,
+                    features: state.features, featureBase: state.featureBase, totalMelFrames: totalMelFrames,
+                    isValid: { $0 * subsampling < valid }, cache: &state.cache, timing: &state.timing)
+                state.nextStart = start + numChunkFrames
+                // the next step reads from its own first frame on
+                let drop = min(
+                    max(0, state.nextStart * subsampling - state.featureBase), state.features.count / numMelBins)
+                state.features.removeFirst(drop * numMelBins)
+                state.featureBase += drop
+                if let onUpdate = state.onUpdate {
+                    let settled = min(state.output.count / numSpeakers, totalMelFrames)
+                    report(state.output, upTo: settled, reported: &state.reportedFrames, to: onUpdate)
+                }
+            }
+            // keep what arrived while the steps ran
+            if let latest = streamState {
+                state.pcm = latest.pcm
+                state.pcmBase = latest.pcmBase
+                state.sampleCount = latest.sampleCount
+            }
+            streamState = state
+            if finishing { return }
+        }
+    }
+
+    // MARK: - Steps
+
+    private func makeCache() -> SpeakerCache {
+        SpeakerCache(
+            policy: metadata.speakerCache, fifoLength: geometry.fifoLength,
+            updatePeriod: geometry.speakerCacheUpdatePeriod, numSpeakers: metadata.numSpeakers,
+            hiddenSize: metadata.hiddenSize, subsampling: metadata.subsamplingFactor)
+    }
+
+    /// Runs the step over encoder frames `start` to `start + numChunkFrames`, looking `numLookahead`
+    /// frames further, and returns the chunk's logits. `features` holds mel frames from `featureBase`;
+    /// a mel frame at or past `totalMelFrames` is padding, and `isValid` says which encoder frames carry
+    /// audio.
+    private func runStep(
+        start: Int, numChunkFrames: Int, numLookahead: Int, features: [Float], featureBase: Int,
+        totalMelFrames: Int, isValid: (Int) -> Bool, cache: inout SpeakerCache, timing: inout DiarizationTiming
+    ) async throws -> ArraySlice<Float> {
+        let clock = ContinuousClock()
+        let subsampling = metadata.subsamplingFactor
+        let hidden = metadata.hiddenSize
+        let numSpeakers = metadata.numSpeakers
+        let numMelBins = MelConfig.nemotronDiarization.nMelBins
+        let windowChunk = geometry.chunkFrames + geometry.lookaheadFrames
+        let numStepEmbeds = numChunkFrames + numLookahead
+        var mark = clock.now
+        let cached = cache.cachedEmbeds
+        let numCached = cache.numCachedFrames
+
+        // left-pad the cache, right-pad the chunk; see export.py for why left
+        var cachedInput = [Float](repeating: 0, count: geometry.cacheFrames * hidden)
+        cachedInput.replaceSubrange(((geometry.cacheFrames - numCached) * hidden)..., with: cached)
+        var chunkInput = [Float](repeating: 0, count: windowChunk * subsampling * numMelBins)
+        let melStart = start * subsampling
+        let melEnd = min((start + numStepEmbeds) * subsampling, totalMelFrames)
+        chunkInput.replaceSubrange(
+            0..<((melEnd - melStart) * numMelBins),
+            with: features[((melStart - featureBase) * numMelBins)..<((melEnd - featureBase) * numMelBins)])
+        var keyMask = [Float](repeating: 0, count: geometry.cacheFrames + windowChunk)
+        for i in (geometry.cacheFrames - numCached)..<geometry.cacheFrames { keyMask[i] = 1 }
+        let chunkValid = (start..<(start + numStepEmbeds)).map(isValid)
+        for (i, valid) in chunkValid.enumerated() where valid { keyMask[geometry.cacheFrames + i] = 1 }
+        timing.hostMs += (clock.now - mark).milliseconds
+
+        mark = clock.now
+        try await step.run(cachedEmbeds: cachedInput, chunkFeatures: chunkInput, keyMask: keyMask)
+        timing.stepsMs += (clock.now - mark).milliseconds
+        timing.steps += 1
+
+        mark = clock.now
+        let (logits, chunkEmbeds) = step.readOutputs()
+        // drop the cache's left padding and the chunk's right padding
+        let offset = geometry.cacheFrames - numCached
+        let stepLogits = Array(
+            logits[(offset * subsampling * numSpeakers)..<((geometry.cacheFrames + numStepEmbeds) * subsampling * numSpeakers)])
+        let inputEmbeds = cached + chunkEmbeds[0..<(numStepEmbeds * hidden)]
+        cache.update(
+            inputEmbeds: inputEmbeds, logits: stepLogits, silenceEmbeds: silenceEmbeds,
+            numChunkFrames: numChunkFrames,
+            mask: [Bool](repeating: true, count: numCached) + chunkValid)
+
+        let first = numCached * subsampling
+        let last = min((numCached + numChunkFrames) * subsampling, first + (melEnd - melStart))
+        timing.hostMs += (clock.now - mark).milliseconds
+        return stepLogits[(first * numSpeakers)..<(last * numSpeakers)]
+    }
+
+    /// Hands `onUpdate` the frames of `output` from `reported` to `settled`, as probabilities.
+    private func report(
+        _ output: [Float], upTo settled: Int, reported: inout Int, to onUpdate: @Sendable (DiarizationUpdate) -> Void
+    ) {
+        guard settled > reported else { return }
+        let numSpeakers = metadata.numSpeakers
+        // the same frames, and the same sigmoid, as the activity returned at the end
+        let probabilities = output[(reported * numSpeakers)..<(settled * numSpeakers)].map { 1 / (1 + exp(-$0)) }
+        onUpdate(
+            DiarizationUpdate(
+                activity: SpeakerActivity(
+                    probabilities: probabilities, numFrames: settled - reported, numSpeakers: numSpeakers,
+                    frameSeconds: Self.frameSeconds),
+                startFrame: reported))
+        reported = settled
+    }
+
+    /// The first `numFrames` frames of `output`, as probabilities.
+    private func activity(_ output: [Float], numFrames: Int) -> SpeakerActivity {
+        let numSpeakers = metadata.numSpeakers
         let probabilities = output.prefix(numFrames * numSpeakers).map { 1 / (1 + exp(-$0)) }
-        let activity = SpeakerActivity(
-            probabilities: probabilities, numFrames: numFrames, numSpeakers: numSpeakers, frameSeconds: frameSeconds)
-        return (activity, timing)
+        return SpeakerActivity(
+            probabilities: probabilities, numFrames: numFrames, numSpeakers: numSpeakers, frameSeconds: Self.frameSeconds)
+    }
+
+    /// Seconds of audio one mel frame, and so one activity frame, covers.
+    private static var frameSeconds: Double {
+        Double(MelConfig.nemotronDiarization.hopLength) / MelConfig.nemotronDiarization.sampleRate
     }
 
     // MARK: - Single steps

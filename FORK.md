@@ -67,7 +67,16 @@ segmentation), the `diarization` CLI and `DiarizationTests`. `Diarizer.diarize(p
 frames as it settles them (`DiarizationUpdate`), for a caller that shows speakers as they are found: a chunk's output
 is final once its step has run, so the updates concatenated are exactly the activity returned (`DiarizationUpdateTests`,
 which run when `exports/` holds the `--split` bundle and `harness-audio/diarization_example.wav`). One update per
-step: four for the 97.6 s example offline, about one a second at low latency. Three additive changes in `CoreAISpeech`, none altering
+step: four for the 97.6 s example offline, about one a second at low latency.
+
+A live session streams instead: `startStream(onUpdate:)`, `stream(pcm:)` as audio arrives, `finishStream()`. It runs
+the same steps as `diarize(pcm:onUpdate:)`, each as soon as its chunk and look-ahead are final, and the result is
+identical (`DiarizationStreamTests` feed the example in half seconds and compare it bit for bit, offline and at low
+latency). That rests on the mel features: Nemotron's are not normalized and a frame reads only 200 samples either
+side of its centre, so a frame is final once the audio reaches 200 samples past it, and the stream computes each one
+once, from a slice beginning two frames earlier (the slice's own zero padding and missing pre-emphasis sample reach
+only its first two frames). Samples and features a step no longer needs are dropped, so a long session holds only
+its outputs. `diarize(pcm:onUpdate:)` and the stream share one step function, `runStep`. Three additive changes in `CoreAISpeech`, none altering
 existing behaviour:
 
 - `DecodeStats.tokenTimings` — the Parakeet TDT loop records each emitted token's frame and duration

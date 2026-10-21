@@ -128,3 +128,38 @@ struct DiarizationUpdateTests {
         if mode == "offline" { #expect(reported.count == 4) } else { #expect(reported.count > 80) }
     }
 }
+
+@Suite("Diarizing a stream", .enabled(if: Exported.isPresent), .serialized)
+struct DiarizationStreamTests {
+    @Test("Fed in half seconds, a stream diarizes exactly as the whole recording", arguments: ["low_latency", "offline"])
+    func streamMatchesTheWholeRecording(mode: String) async throws {
+        let pcm = try Exported.pcm()
+        let diarizer = try await Diarizer(bundleAt: Exported.bundle, mode: mode)
+        let (whole, wholeTiming) = try await diarizer.diarize(pcm: pcm)
+
+        let updates = Mutex<[DiarizationUpdate]>([])
+        await diarizer.startStream { update in updates.withLock { $0.append(update) } }
+        var reportedByTen = 0
+        for start in stride(from: 0, to: pcm.count, by: 8_000) {
+            try await diarizer.stream(pcm: Array(pcm[start..<min(start + 8_000, pcm.count)]))
+            if start + 8_000 == 160_000 { reportedByTen = updates.withLock { $0.last?.endFrame ?? 0 } }
+        }
+        let (streamed, timing) = try await diarizer.finishStream()
+        let reported = updates.withLock { $0 }
+
+        #expect(streamed.numFrames == whole.numFrames)
+        #expect(streamed.probabilities == whole.probabilities)
+        #expect(timing.steps == wholeTiming.steps)
+        #expect(reported.flatMap(\.activity.probabilities) == whole.probabilities)
+        // At low latency a step waits for its 1.04 s, so ten seconds in, about nine are settled; offline,
+        // the first step waits for 30 s and more.
+        if mode == "low_latency" { #expect(reportedByTen >= 800) } else { #expect(reportedByTen == 0) }
+    }
+
+    @Test("A stream that was not started is refused")
+    func notStarted() async throws {
+        let diarizer = try await Diarizer(bundleAt: Exported.bundle, mode: "low_latency")
+        await #expect(throws: DiarizationError.self) { try await diarizer.stream(pcm: [0]) }
+        await #expect(throws: DiarizationError.self) { try await diarizer.finishStream() }
+    }
+}
