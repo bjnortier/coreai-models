@@ -280,9 +280,17 @@ public actor SpeechRecognitionModel {
     }
 
     /// Samples the encoder consumes per pass, or `nil` when it accepts any length.
-    private var staticWindowSamples: Int? {
+    private nonisolated var staticWindowSamples: Int? {
         guard let nFrames = melConfig.nFrames else { return nil }
         return nFrames * melConfig.hopLength
+    }
+
+    /// Seconds of audio the encoder consumes per pass — Whisper's 30 — or `nil` when it accepts any length.
+    ///
+    /// Audio up to this long costs one encoder pass, padded to the window; longer audio is split into windows.
+    /// A caller transcribing a recording as it grows can decode up to this much in one pass at no extra cost.
+    public nonisolated var windowSeconds: Double? {
+        staticWindowSamples.map { Double($0) / melConfig.sampleRate }
     }
 
     // MARK: - Word timestamps

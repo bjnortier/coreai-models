@@ -199,6 +199,8 @@ mode is a repeated word rather than dropped speech.
 
 Windowing keys off `MelConfig.nFrames`, so a dynamic encoder (Parakeet's, unless
 exported at a static length) still takes the whole waveform in one pass.
+`SpeechRecognitionModel.windowSeconds` reports that window (`nil` for a dynamic encoder), so a host decoding
+a recording as it grows can decode up to one window per pass.
 
 <a name="relationship-to-upstream-streaming"></a>
 #### Relationship to upstream streaming
